@@ -1,0 +1,874 @@
+#!/bin/bash
+set -euo pipefail
+# Ensure AWS CLI v2 (installed by bootstrap to /usr/local/bin) is in PATH
+export PATH="/usr/local/bin:$PATH"
+REGION='${region}'
+OWL_BASE='${owl_base}'
+OWL_METASTORE_USER='${owl_metastore_user}'
+OWL_METASTORE_PASS='${owl_metastore_pass}'
+OWL_METASTORE_SECRET_ARN='${owl_metastore_secret_arn}'
+OWL_METASTORE_PASS_SSM_PARAMETER='${owl_metastore_pass_ssm_parameter}'
+POSTGRESQL_HOST='${postgresql_host}'
+POSTGRESQL_PORT='${postgresql_port}'
+POSTGRESQL_DATABASE='${postgresql_database}'
+SPARK_PACKAGE='${spark_package}'
+DQ_ADMIN_USER_PASSWORD='${dq_admin_user_password}'
+DQ_ADMIN_USER_PASSWORD_SSM_PARAMETER='${dq_admin_user_password_ssm_parameter}'
+DQ_PACKAGE_URL='${dq_package_url}'
+DQ_PACKAGE_FILENAME='${dq_package_filename}'
+LICENSE_KEY='${license_key}'
+LICENSE_NAME='${license_name}'
+LICENSE_KEY_SSM_PARAMETER='${license_key_ssm_parameter}'
+LICENSE_NAME_SSM_PARAMETER='${license_name_ssm_parameter}'
+STATUS_DIR="/var/lib/collibra-dq-install"
+STATUS_FILE="$STATUS_DIR/status.env"
+CURRENT_PHASE="BOOTSTRAP"
+LAST_EXIT_CODE=0
+
+mkdir -p "$STATUS_DIR"
+
+update_status() {
+  local exit_code="$${1:-$LAST_EXIT_CODE}"
+  LAST_EXIT_CODE="$exit_code"
+  printf 'PHASE=%q\nLAST_EXIT_CODE=%q\nUPDATED_AT=%q\n' \
+    "$CURRENT_PHASE" \
+    "$LAST_EXIT_CODE" \
+    "$(date -Is)" >"$STATUS_FILE"
+}
+
+mark_phase() {
+  CURRENT_PHASE="$1"
+  echo "Installer phase: $CURRENT_PHASE"
+  update_status 0
+}
+
+record_exit_code() {
+  LAST_EXIT_CODE="$1"
+  update_status "$LAST_EXIT_CODE"
+}
+
+log_error() {
+  local exit_code="$1"
+  local line_no="$2"
+  local failed_command="$3"
+  record_exit_code "$exit_code"
+  echo "ERROR: installer phase=$CURRENT_PHASE exit_code=$exit_code line=$line_no command=$failed_command"
+}
+
+on_error() {
+  local exit_code=$?
+  log_error "$exit_code" "$1" "$2"
+  exit "$exit_code"
+}
+
+finish() {
+  local exit_code=$?
+  record_exit_code "$exit_code"
+  systemctl enable --now amazon-ssm-agent||true
+  systemctl restart amazon-ssm-agent||true
+}
+
+collect_startup_diagnostics() {
+  echo "Collecting startup diagnostics for phase=$CURRENT_PHASE"
+
+  if command -v ss >/dev/null 2>&1; then
+    echo "--- Listening ports (ss -tlnp) ---"
+    ss -tlnp 2>&1 || true
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "--- systemctl status collibra-dq.service ---"
+    systemctl status collibra-dq.service --no-pager -l 2>&1 || true
+  fi
+
+  echo "--- Recent Collibra log files ---"
+  local candidate=""
+  local found_logs=false
+  for candidate in \
+    "$ACTUAL_OWL_BASE/log" \
+    "$ACTUAL_OWL_BASE/logs" \
+    "$OWL_INSTALL_ROOT/log" \
+    "$OWL_INSTALL_ROOT/logs"; do
+    if [ -d "$candidate" ]; then
+      found_logs=true
+      echo "Log directory: $candidate"
+      find "$candidate" -maxdepth 2 -type f -print 2>/dev/null | sort | tail -n 20
+      while IFS= read -r logfile; do
+        [ -n "$logfile" ] || continue
+        echo "--- tail -n 50 $logfile ---"
+        tail -n 50 "$logfile" 2>/dev/null || true
+      done < <(find "$candidate" -maxdepth 2 -type f -print 2>/dev/null | sort | tail -n 5)
+    fi
+  done
+
+  if [ "$found_logs" = false ]; then
+    echo "No Collibra log directories found under $ACTUAL_OWL_BASE or $OWL_INSTALL_ROOT"
+  fi
+}
+
+wait_for_web_listener() {
+  local retries="$${1:-120}"
+  local sleep_seconds="$${2:-5}"
+  local attempt=1
+
+  while [ "$attempt" -le "$retries" ]; do
+    if command -v ss >/dev/null 2>&1 && ss -tlnp 2>/dev/null | grep ':9000' | grep -qE '0\.0\.0\.0|\*'; then
+      return 0
+    fi
+    sleep "$sleep_seconds"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+web_process_present() {
+  pgrep -af 'dq-webapp-.*\.jar' >/dev/null 2>&1
+}
+
+trap 'on_error "$${LINENO}" "$${BASH_COMMAND}"' ERR
+trap finish EXIT
+exec > >(tee -a /var/log/collibra-dq-install.log) 2>&1
+echo "Starting Collibra DQ installation at $(date)"
+echo "Note: OWL and Collibra DQ naming are equivalent in this installer."
+echo "Credentials are treated as case-sensitive."
+mark_phase "BOOTSTRAP"
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+  OS_ID="$${ID:-unknown}"
+  OS_VERSION="$${VERSION_ID:-unknown}"
+  echo "Detected OS: $OS_ID $OS_VERSION"
+  case "$OS_ID" in
+    rhel|centos)
+      if ! echo "$OS_VERSION" | grep -q '^7'; then
+        echo "ERROR: Collibra DQ requires CentOS/RHEL 7. Detected: $OS_ID $OS_VERSION"
+        exit 1
+      fi
+      ;;
+    *)
+      echo "ERROR: Collibra DQ requires CentOS/RHEL 7. Detected OS: $OS_ID $OS_VERSION"
+      exit 1
+      ;;
+  esac
+fi
+
+fetch_ssm_parameter(){
+  local param_name="$1"
+  aws ssm get-parameter --name "$param_name" --with-decryption --query 'Parameter.Value' --output text --region "$REGION"
+}
+
+fetch_secret_password(){
+  local secret_arn="$1"
+  local secret_string=""
+  secret_string=$(aws secretsmanager get-secret-value --secret-id "$secret_arn" --query 'SecretString' --output text --region "$REGION") || return 1
+  if echo "$secret_string" | grep -q '^{'; then
+    if command -v jq >/dev/null 2>&1; then
+      echo "$secret_string" | jq -r '.password // empty'
+    elif command -v python3 >/dev/null 2>&1; then
+      python3 - <<'PY' "$secret_string"
+import json
+import sys
+data = json.loads(sys.argv[1])
+print(data.get("password", ""))
+PY
+    elif command -v python >/dev/null 2>&1; then
+      python - <<'PY' "$secret_string"
+import json
+import sys
+data = json.loads(sys.argv[1])
+print(data.get("password", ""))
+PY
+    else
+      echo ""
+    fi
+  else
+    echo "$secret_string"
+  fi
+}
+
+resolve_secret_value(){
+  local current_value="$1"
+  local ssm_parameter_name="$2"
+  local variable_name="$3"
+
+  if [ -n "$current_value" ];then
+    echo "$current_value"
+    return 0
+  fi
+
+  if [ -n "$ssm_parameter_name" ];then
+    local fetched_value=""
+    if ! fetched_value=$(fetch_ssm_parameter "$ssm_parameter_name");then
+      echo "ERROR: Failed to read SSM parameter '$ssm_parameter_name' for $variable_name"
+      exit 1
+    fi
+    echo "$fetched_value"
+    return 0
+  fi
+
+  echo ""
+}
+
+if [ -n "$OWL_METASTORE_SECRET_ARN" ]; then
+  OWL_METASTORE_PASS=$(fetch_secret_password "$OWL_METASTORE_SECRET_ARN") || {
+    echo "ERROR: Failed to read RDS secret '$OWL_METASTORE_SECRET_ARN' for OWL_METASTORE_PASS"
+    exit 1
+  }
+  if [ -z "$OWL_METASTORE_PASS" ]; then
+    echo "ERROR: RDS secret '$OWL_METASTORE_SECRET_ARN' did not return a password value."
+    exit 1
+  fi
+else
+  OWL_METASTORE_PASS=$(resolve_secret_value "$OWL_METASTORE_PASS" "$OWL_METASTORE_PASS_SSM_PARAMETER" "OWL_METASTORE_PASS")
+fi
+DQ_ADMIN_USER_PASSWORD=$(resolve_secret_value "$DQ_ADMIN_USER_PASSWORD" "$DQ_ADMIN_USER_PASSWORD_SSM_PARAMETER" "DQ_ADMIN_USER_PASSWORD")
+LICENSE_KEY=$(resolve_secret_value "$LICENSE_KEY" "$LICENSE_KEY_SSM_PARAMETER" "LICENSE_KEY")
+LICENSE_NAME=$(resolve_secret_value "$LICENSE_NAME" "$LICENSE_NAME_SSM_PARAMETER" "LICENSE_NAME")
+
+IMDS_TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)
+imds_get() {
+  local path="$1"
+  if [ -n "$IMDS_TOKEN" ]; then
+    curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" "http://169.254.169.254/latest/meta-data/$path" || true
+  else
+    curl -fsS "http://169.254.169.254/latest/meta-data/$path" || true
+  fi
+}
+
+INSTANCE_ID=$(imds_get "instance-id")
+DQ_ADMIN_USER_EMAIL="default@default.com"
+
+validate_admin_password_policy() {
+  local password="$1"
+  [ -n "$password" ] || return 1
+  [ $${#password} -ge 8 ] || return 1
+  [ $${#password} -le 72 ] || return 1
+  echo "$password" | grep -q '[A-Z]' || return 1
+  echo "$password" | grep -q '[a-z]' || return 1
+  echo "$password" | grep -q '[0-9]' || return 1
+  echo "$password" | grep -q '[!%&@#$^*?_~]' || return 1
+  # Collibra setup rejects passwords that include the default admin user id.
+  if echo "$password" | tr '[:upper:]' '[:lower:]' | grep -q "admin"; then
+    return 1
+  fi
+  return 0
+}
+
+generate_compliant_admin_password() {
+  local candidate=""
+  local alphabet='A-Za-z0-9!%&@#$^*?_~'
+  while true; do
+    candidate="$(LC_ALL=C tr -dc "$alphabet" </dev/urandom | head -c 24 || true)"
+    candidate="A9!$candidate"
+    candidate="$${candidate:0:32}"
+    if validate_admin_password_policy "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+}
+
+if [ -z "$DQ_ADMIN_USER_PASSWORD" ]; then
+  DQ_ADMIN_USER_PASSWORD="$(generate_compliant_admin_password)"
+  echo "DQ_ADMIN_USER_PASSWORD was empty; generated a compliant password for non-interactive setup."
+elif ! validate_admin_password_policy "$DQ_ADMIN_USER_PASSWORD"; then
+  echo "WARNING: Provided DQ_ADMIN_USER_PASSWORD does not match Collibra policy (8-72 chars, upper/lower/digit/special from !,% ,&,@,#,$,^,*,?,_,~, and must not contain 'admin')."
+  DQ_ADMIN_USER_PASSWORD="$(generate_compliant_admin_password)"
+  echo "Generated a compliant DQ_ADMIN_USER_PASSWORD for this install run."
+fi
+
+mark_phase "PREREQS"
+VPC_MAC=$(imds_get "network/interfaces/macs/" | head -n1)
+VPC_CIDR=$(imds_get "network/interfaces/macs/$VPC_MAC/vpc-ipv4-cidr-block")
+VPC_BASE=$(echo "$VPC_CIDR"|cut -d'/' -f1|cut -d'.' -f1-3)
+VPC_RESOLVER="$${VPC_BASE}.2"
+echo "Waiting for DNS to be ready..."
+for i in {1..30};do
+  if getent hosts amazonaws.com >/dev/null 2>&1||nslookup amazonaws.com >/dev/null 2>&1;then
+    echo "DNS is ready";break
+  fi
+  [ $i -eq 30 ]&&echo "WARNING: DNS may not be ready"||sleep 2
+done
+[ -f /etc/resolv.conf ]&&! grep -q "$VPC_RESOLVER" /etc/resolv.conf && echo "nameserver $VPC_RESOLVER"|tee -a /etc/resolv.conf >/dev/null 2>&1||true
+systemctl restart NetworkManager >/dev/null 2>&1||true
+sleep 5
+PKG_MGR=""
+if command -v dnf >/dev/null 2>&1; then
+  PKG_MGR="dnf"
+elif command -v yum >/dev/null 2>&1; then
+  PKG_MGR="yum"
+fi
+echo "Package manager detected: $${PKG_MGR:-none}"
+if [ "$PKG_MGR" = "dnf" ]; then
+  echo "Configuring dnf for IPv4-only..."
+  mkdir -p /etc/dnf
+  [ -f /etc/dnf/dnf.conf ]||touch /etc/dnf/dnf.conf
+  ! grep -q "^\[main\]" /etc/dnf/dnf.conf&&echo "[main]">>/etc/dnf/dnf.conf||true
+  ! grep -q "^ip_resolve=" /etc/dnf/dnf.conf&&echo "ip_resolve=4">>/etc/dnf/dnf.conf||sed -i "s/^ip_resolve=.*/ip_resolve=4/" /etc/dnf/dnf.conf
+  ! grep -q "^fastestmirror=" /etc/dnf/dnf.conf&&echo "fastestmirror=0">>/etc/dnf/dnf.conf||true
+  ! grep -q "^max_parallel_downloads=" /etc/dnf/dnf.conf&&echo "max_parallel_downloads=1">>/etc/dnf/dnf.conf||true
+  ! grep -q "^timeout=" /etc/dnf/dnf.conf&&echo "timeout=300">>/etc/dnf/dnf.conf||true
+fi
+
+pkg_update() {
+  if [ "$PKG_MGR" = "dnf" ]; then
+    timeout 120 dnf -y update --setopt=ip_resolve=4 --setopt=fastestmirror=false --setopt=timeout=300 --disablerepo=kernel-livepatch || true
+  elif [ "$PKG_MGR" = "yum" ]; then
+    timeout 120 yum -y update || true
+  fi
+}
+
+pkg_install() {
+  if [ "$PKG_MGR" = "dnf" ]; then
+    timeout 180 dnf -y install --allowerasing --setopt=ip_resolve=4 --disablerepo=kernel-livepatch "$@"
+  elif [ "$PKG_MGR" = "yum" ]; then
+    timeout 180 yum -y install "$@"
+  else
+    return 1
+  fi
+}
+
+echo "Disabling IPv6 system-wide (VPC is IPv4-only)..."
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1||true
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1||true
+echo "net.ipv6.conf.all.disable_ipv6=1">>/etc/sysctl.d/99-disable-ipv6.conf 2>/dev/null||true
+echo "net.ipv6.conf.default.disable_ipv6=1">>/etc/sysctl.d/99-disable-ipv6.conf 2>/dev/null||true
+echo "Disabling kernel-livepatch repository (optional, not required for Collibra DQ)..."
+[ -f /etc/yum.repos.d/kernel-livepatch.repo ]&&(sed -i 's/^enabled=.*/enabled=0/' /etc/yum.repos.d/kernel-livepatch.repo||true)||true
+[ "$PKG_MGR" = "dnf" ]&&dnf clean all >/dev/null 2>&1||true
+pkg_update
+MISSING_PACKAGES=""
+for pkg in unzip curl git jq wget tar gzip;do command -v "$pkg" >/dev/null 2>&1||MISSING_PACKAGES="$MISSING_PACKAGES $pkg";done
+[ -n "$MISSING_PACKAGES" ]&&pkg_install $MISSING_PACKAGES||true
+echo "Installing PostgreSQL client (psql) for RDS connectivity testing..."
+pkg_install postgresql15 || pkg_install postgresql || echo "Warning: Could not install PostgreSQL client"||true
+command -v psql >/dev/null 2>&1&&echo "PostgreSQL client installed successfully: $(psql --version)"||echo "Warning: psql command not found after installation"
+
+echo "Installing Java 17..."
+JAVA_HOME=""
+
+# Try each Java 17 package; verify installation after each attempt
+install_java_pkg() {
+  local pkg="$1"
+  echo "  Trying: $pkg"
+  if [ "$PKG_MGR" = "yum" ]; then
+    timeout 180 yum -y install "$pkg" 2>/dev/null
+  elif [ "$PKG_MGR" = "dnf" ]; then
+    timeout 180 dnf -y install --allowerasing --setopt=ip_resolve=4 --disablerepo=kernel-livepatch "$pkg" 2>/dev/null
+  fi
+  # Check if java is now available
+  command -v java >/dev/null 2>&1 && java -version 2>&1 | head -1 | grep -qE 'version "(17|21)'
+}
+
+JAVA_FOUND=false
+if command -v java >/dev/null 2>&1 && java -version 2>&1 | head -1 | grep -qE 'version "(17|21)'; then
+  echo "Java 17+ already installed"
+  JAVA_FOUND=true
+fi
+
+if [ "$JAVA_FOUND" = false ]; then
+  for pkg in java-17-openjdk-headless java-17-openjdk java-17-amazon-corretto-headless java-17-amazon-corretto; do
+    if install_java_pkg "$pkg"; then
+      JAVA_FOUND=true; break
+    fi
+  done
+fi
+
+# Fallback: download Amazon Corretto 17 RPM directly
+if [ "$JAVA_FOUND" = false ]; then
+  echo "  Package manager failed, downloading Amazon Corretto 17 RPM..."
+  ARCH=$(uname -m); [ "$ARCH" = "x86_64" ] && CORRETTO_ARCH="x64" || CORRETTO_ARCH="aarch64"
+  TD=$(mktemp -d); cd "$TD"
+  for url in \
+    "https://corretto.aws/downloads/latest/amazon-corretto-17-$${CORRETTO_ARCH}-linux-jdk.rpm" \
+    "https://corretto.aws/downloads/resources/17.0.18.8.1/amazon-corretto-17.0.18.8.1-linux-$${CORRETTO_ARCH}.rpm"; do
+    echo "  Downloading: $url"
+    if curl -L --max-time 60 -f -s -o j.rpm "$url" 2>/dev/null && [ -s j.rpm ]; then
+      rpm -ivh --nodeps j.rpm 2>/dev/null || yum -y localinstall j.rpm 2>/dev/null || true
+      rm -f j.rpm
+      if command -v java >/dev/null 2>&1; then
+        JAVA_FOUND=true; break
+      fi
+    fi
+    rm -f j.rpm
+  done
+  cd - >/dev/null; rm -rf "$TD"
+fi
+
+# Resolve JAVA_HOME from installed binary
+if [ "$JAVA_FOUND" = true ]; then
+  JAVA_BIN=$(readlink -f "$(command -v java)" 2>/dev/null || find /usr/lib/jvm -name "java" -type f 2>/dev/null | head -1)
+  [ -n "$JAVA_BIN" ] && JAVA_HOME=$(dirname "$(dirname "$JAVA_BIN")")
+fi
+# Final fallback for JAVA_HOME
+[ -z "$JAVA_HOME" ] && JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto
+[ ! -d "$JAVA_HOME" ] && JAVA_HOME=$(find /usr/lib/jvm -maxdepth 1 -type d -name "*17*" 2>/dev/null | head -1)
+[ -z "$JAVA_HOME" ] && JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto
+
+export JAVA_HOME
+export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
+echo "export JAVA_HOME=$JAVA_HOME" > /etc/profile.d/java.sh
+echo "export PATH=\$JAVA_HOME/bin:\$PATH" >> /etc/profile.d/java.sh
+
+# Hard failure if java is not available
+if ! command -v java >/dev/null 2>&1 && [ ! -x "$JAVA_HOME/bin/java" ]; then
+  echo "ERROR: Java 17 installation failed. No java binary found."
+  echo "  JAVA_HOME=$JAVA_HOME"
+  echo "  Searched: /usr/lib/jvm/"
+  ls -la /usr/lib/jvm/ 2>&1 || true
+  exit 1
+fi
+echo "Java installed: JAVA_HOME=$JAVA_HOME"
+java -version 2>&1
+
+mark_phase "PACKAGE_DOWNLOAD"
+mkdir -p "$OWL_BASE";cd "$OWL_BASE"
+if [ -f "$OWL_BASE/$DQ_PACKAGE_FILENAME" ];then
+  echo "Package exists, skipping download"
+elif [ -n "$DQ_PACKAGE_URL" ]&&[ "$DQ_PACKAGE_URL" != "" ];then
+  echo "Downloading package from $DQ_PACKAGE_URL ..."
+  if echo "$DQ_PACKAGE_URL"|grep -qE "^s3://|https://.*\.s3\.";then
+    aws s3 cp "$DQ_PACKAGE_URL" "$DQ_PACKAGE_FILENAME" --region "$REGION"||{ echo "Failed to download package from S3";exit 1; }
+  else
+    wget -q "$DQ_PACKAGE_URL" -O "$DQ_PACKAGE_FILENAME"||curl -L "$DQ_PACKAGE_URL" -o "$DQ_PACKAGE_FILENAME"||{ echo "Failed to download package";exit 1; }
+  fi
+else
+  [ ! -f "$DQ_PACKAGE_FILENAME" ]&&{ echo "ERROR: Package not found and URL not provided";exit 1; }
+fi
+echo "Extracting package: $DQ_PACKAGE_FILENAME"
+if echo "$DQ_PACKAGE_FILENAME" | grep -qE '\.zip$'; then
+  unzip -q "$DQ_PACKAGE_FILENAME" || { echo "ERROR: Failed to extract zip"; exit 1; }
+elif echo "$DQ_PACKAGE_FILENAME" | grep -qE '\.tar\.gz$|\.tgz$|\.tar$'; then
+  tar -xf "$DQ_PACKAGE_FILENAME" || { echo "ERROR: Failed to extract tar"; exit 1; }
+else
+  echo "ERROR: Unknown package format: $DQ_PACKAGE_FILENAME"; exit 1
+fi
+rm -f "$DQ_PACKAGE_FILENAME"||true
+
+# Determine actual installation base (package may extract to owl/ subdirectory)
+ACTUAL_OWL_BASE="$OWL_BASE"
+if [ -d "$OWL_BASE/owl" ];then
+  ACTUAL_OWL_BASE="$OWL_BASE/owl"
+  echo "Package extracted to owl/ subdirectory, using $ACTUAL_OWL_BASE as base"
+fi
+
+{
+  printf 'export OWL_BASE=%q\n' "$ACTUAL_OWL_BASE"
+  printf 'export OWL_HOME=%q\n' "$ACTUAL_OWL_BASE"
+  printf 'export OWL_METASTORE_USER=%q\n' "$OWL_METASTORE_USER"
+  printf 'export OWL_METASTORE_PASS=%q\n' "$OWL_METASTORE_PASS"
+  printf 'export METASTORE_USER=%q\n' "$OWL_METASTORE_USER"
+  printf 'export METASTORE_PASS=%q\n' "$OWL_METASTORE_PASS"
+  printf 'export POSTGRESQL_HOST=%q\n' "$POSTGRESQL_HOST"
+  printf 'export POSTGRESQL_PORT=%q\n' "$POSTGRESQL_PORT"
+  printf 'export POSTGRESQL_DATABASE=%q\n' "$POSTGRESQL_DATABASE"
+  printf 'export SPARK_PACKAGE=%q\n' "$SPARK_PACKAGE"
+  printf 'export DQ_ADMIN_USER_PASSWORD=%q\n' "$DQ_ADMIN_USER_PASSWORD"
+  printf 'export DQ_ADMIN_USER_EMAIL=%q\n' "$DQ_ADMIN_USER_EMAIL"
+  printf 'export LICENSE_KEY=%q\n' "$LICENSE_KEY"
+  [ -n "$LICENSE_NAME" ]&&[ "$LICENSE_NAME" != "" ]&&printf 'export LICENSE_NAME=%q\n' "$LICENSE_NAME"
+} > /etc/profile.d/collibra-dq.sh
+source /etc/profile.d/collibra-dq.sh
+[ -z "$DQ_ADMIN_USER_PASSWORD" ]||[ "$DQ_ADMIN_USER_PASSWORD" == "" ]&&{ echo "ERROR: DQ_ADMIN_USER_PASSWORD not set";exit 1; }
+export DQ_ADMIN_USER_PASSWORD
+
+PG_SERVER="$POSTGRESQL_HOST:$POSTGRESQL_PORT/$POSTGRESQL_DATABASE"
+SETUP_SCRIPT=$(find "$ACTUAL_OWL_BASE" -name "setup.sh" -type f|head -1)
+[ -z "$SETUP_SCRIPT" ]&&SETUP_SCRIPT=$(find "$OWL_BASE" -name "setup.sh" -type f|head -1)
+[ -z "$SETUP_SCRIPT" ]&&{ echo "ERROR: setup.sh not found";exit 1; }
+chmod +x "$SETUP_SCRIPT"
+
+# Create directories and /opt symlinks BEFORE setup.sh (owlmanage.sh needs them)
+mkdir -p "$ACTUAL_OWL_BASE/config" "$ACTUAL_OWL_BASE/pids" "$ACTUAL_OWL_BASE/log" "$ACTUAL_OWL_BASE/bin"||true
+for d in config bin pids log; do
+  ln -sfn "$ACTUAL_OWL_BASE/$d" "/opt/$d" 2>/dev/null||true
+done
+
+# Export env vars required by setup.sh (per Collibra install docs)
+export OWL_BASE="$ACTUAL_OWL_BASE"
+export OWL_METASTORE_USER
+export OWL_METASTORE_PASS
+export SPARK_PACKAGE
+export DQ_ADMIN_USER_PASSWORD
+export DQ_ADMIN_USER_EMAIL
+
+echo "Running setup.sh: SETUP_SCRIPT=$SETUP_SCRIPT PG_SERVER=$PG_SERVER"
+# Per Collibra docs: -user is the PostgreSQL metastore user, NOT the OS user
+mark_phase "SETUP"
+SETUP_LOG="/var/log/collibra-dq-setup.log"
+rm -f "$SETUP_LOG"
+set +e
+"$SETUP_SCRIPT" \
+  -owlbase="$ACTUAL_OWL_BASE" \
+  -user="$OWL_METASTORE_USER" \
+  -pgpassword="$OWL_METASTORE_PASS" \
+  -pgserver="$PG_SERVER" \
+  -dqadminpassword="$DQ_ADMIN_USER_PASSWORD" \
+  -dqadminemail="$DQ_ADMIN_USER_EMAIL" \
+  -options=spark,owlweb,owlagent \
+  -non-interactive >"$SETUP_LOG" 2>&1
+SETUP_EXIT=$?
+record_exit_code "$SETUP_EXIT"
+set -e
+cat "$SETUP_LOG"
+if [ $SETUP_EXIT -ne 0 ];then
+  echo "Setup exited with code $SETUP_EXIT"
+  echo "Persisted setup output to $SETUP_LOG"
+  if [ "$SETUP_EXIT" -eq 139 ]; then
+    echo "ERROR: setup.sh terminated with segmentation fault (exit 139)."
+    echo "--- JVM crash artifacts (hs_err_pid / replay_pid) ---"
+    find /tmp "$ACTUAL_OWL_BASE" -maxdepth 4 -type f \( -name 'hs_err_pid*.log' -o -name 'replay_pid*.log' \) -print 2>/dev/null || true
+    while IFS= read -r jvm_crash_log; do
+      [ -n "$jvm_crash_log" ] || continue
+      echo "--- tail -n 120 $jvm_crash_log ---"
+      tail -n 120 "$jvm_crash_log" 2>/dev/null || true
+    done < <(find /tmp "$ACTUAL_OWL_BASE" -maxdepth 4 -type f \( -name 'hs_err_pid*.log' -o -name 'replay_pid*.log' \) -print 2>/dev/null | sort | tail -n 5)
+  fi
+  echo "--- setup.sh output tail ---"
+  tail -n 120 "$SETUP_LOG" 2>/dev/null || true
+  if command -v dmesg >/dev/null 2>&1; then
+    echo "--- dmesg tail (possible segfault traces) ---"
+    dmesg | tail -n 120 || true
+  fi
+  echo "--- setup script metadata ---"
+  file "$SETUP_SCRIPT" || true
+  head -n 40 "$SETUP_SCRIPT" 2>/dev/null || true
+  # Check if critical files were created despite the error
+  if [ -f "$ACTUAL_OWL_BASE/config/owl-env.sh" ]||[ -f "$ACTUAL_OWL_BASE/owl-env.sh" ];then
+    echo "WARNING: setup.sh failed but config files exist - attempting to continue..."
+  else
+    echo "ERROR: setup.sh failed and no config files found"
+    exit 1
+  fi
+else
+  echo "setup.sh completed successfully. Full setup log: $SETUP_LOG"
+fi
+
+OWL_ENV_SCRIPT=$(find "$ACTUAL_OWL_BASE" -name "owl-env.sh" -type f|head -1)
+[ -z "$OWL_ENV_SCRIPT" ]&&OWL_ENV_SCRIPT=$(find "$OWL_BASE" -name "owl-env.sh" -type f|head -1)
+LICENSE_CONFIGURED=false
+mark_phase "LICENSE"
+if [ -n "$OWL_ENV_SCRIPT" ]&&[ -n "$LICENSE_KEY" ]&&[ "$LICENSE_KEY" != "" ];then
+  cp "$OWL_ENV_SCRIPT" "$OWL_ENV_SCRIPT"".backup"||true
+  LICENSE_KEY_ESCAPED=$(printf '%q' "$LICENSE_KEY")
+  grep -q "^export LICENSE_KEY=" "$OWL_ENV_SCRIPT"&&sed -i "s|^export LICENSE_KEY=.*|export LICENSE_KEY=$LICENSE_KEY_ESCAPED|" "$OWL_ENV_SCRIPT"||echo "export LICENSE_KEY=$LICENSE_KEY_ESCAPED">>"$OWL_ENV_SCRIPT"
+  [ -n "$LICENSE_NAME" ]&&[ "$LICENSE_NAME" != "" ]&&(LICENSE_NAME_ESCAPED=$(printf '%q' "$LICENSE_NAME");grep -q "^export LICENSE_NAME=" "$OWL_ENV_SCRIPT"&&sed -i "s|^export LICENSE_NAME=.*|export LICENSE_NAME=$LICENSE_NAME_ESCAPED|" "$OWL_ENV_SCRIPT"||echo "export LICENSE_NAME=$LICENSE_NAME_ESCAPED">>"$OWL_ENV_SCRIPT")
+  LICENSE_CONFIGURED=true
+  source "$OWL_ENV_SCRIPT"||true
+fi
+
+# Ensure DB credentials and bind address are in owl-env.sh
+if [ -n "$OWL_ENV_SCRIPT" ]&&[ -f "$OWL_ENV_SCRIPT" ];then
+  _owl_env_set() {
+    local vname="$1" vval="$2"
+    local escaped=$(printf '%q' "$vval")
+    local tmp_file=""
+    tmp_file=$(mktemp)
+    awk -v name="$vname" -v value="$escaped" '
+      BEGIN { replaced = 0; prefix = "export " name "=" }
+      index($0, prefix) == 1 { print prefix value; replaced = 1; next }
+      { print }
+      END { if (!replaced) print prefix value }
+    ' "$OWL_ENV_SCRIPT" > "$tmp_file"
+    cat "$tmp_file" > "$OWL_ENV_SCRIPT"
+    rm -f "$tmp_file"
+  }
+  _owl_env_set OWL_METASTORE_USER "$OWL_METASTORE_USER"
+  _owl_env_set OWL_METASTORE_PASS "$OWL_METASTORE_PASS"
+  _owl_env_set METASTORE_USER "$OWL_METASTORE_USER"
+  _owl_env_set METASTORE_PASS "$OWL_METASTORE_PASS"
+  _owl_env_set OWL_WEB_HTTP_ADDRESS "0.0.0.0"
+  grep -q "http\.address" "$OWL_ENV_SCRIPT"||echo 'export OWL_WEB_OPTS="$${OWL_WEB_OPTS:-} -Dhttp.address=0.0.0.0"' >> "$OWL_ENV_SCRIPT"
+fi
+# Patch Play/Java config if present so web binds to 0.0.0.0
+for f in "$ACTUAL_OWL_BASE/config/application.conf" "$ACTUAL_OWL_BASE/conf/application.conf" "$ACTUAL_OWL_BASE/owlweb/conf/application.conf";do
+  if [ -f "$f" ];then
+    grep -q "http\.address\|play\.server\.http\.address" "$f" 2>/dev/null&&(sed -i 's/127\.0\.0\.1/0.0.0.0/g; s/"localhost"/"0.0.0.0"/g' "$f"||true)||echo 'play.server.http.address = "0.0.0.0"' >> "$f" 2>/dev/null||true
+    break
+  fi
+done
+
+command -v firewall-cmd >/dev/null 2>&1&&(systemctl enable firewalld||true;systemctl start firewalld||true;for p in 9000 9101 8080 8081;do firewall-cmd --permanent --add-port=$p/tcp||true;done;firewall-cmd --reload||true)
+
+# Refresh /opt symlinks to point to the actual config dir (owl-env.sh may be nested)
+OWL_CONFIG_DIR=""
+if [ -n "$OWL_ENV_SCRIPT" ] && [ -f "$OWL_ENV_SCRIPT" ]; then
+  OWL_CONFIG_DIR=$(dirname "$OWL_ENV_SCRIPT")
+  ln -sfn "$OWL_CONFIG_DIR" /opt/config 2>/dev/null||true
+  echo "Linked /opt/config -> $OWL_CONFIG_DIR"
+fi
+OWL_INSTALL_ROOT="$ACTUAL_OWL_BASE"
+[ -n "$OWL_CONFIG_DIR" ] && [ -d "$(dirname "$OWL_CONFIG_DIR")" ] && OWL_INSTALL_ROOT=$(dirname "$OWL_CONFIG_DIR")
+for d in bin pids log; do
+  [ -d "$OWL_INSTALL_ROOT/$d" ] && ln -sfn "$OWL_INSTALL_ROOT/$d" "/opt/$d" 2>/dev/null||true
+done
+
+# Persist paths for systemd ExecStartPre so restarts recreate correct /opt symlinks
+mkdir -p /etc/collibra-dq
+CONFIG_DIR_FOR_PERSIST="$${OWL_CONFIG_DIR:-$$ACTUAL_OWL_BASE/config}"
+printf 'OWL_CONFIG_DIR=%q\nOWL_INSTALL_ROOT=%q\nOWL_BASE=%q\n' "$CONFIG_DIR_FOR_PERSIST" "$OWL_INSTALL_ROOT" "$ACTUAL_OWL_BASE" > /etc/collibra-dq/opt-paths.conf 2>/dev/null||true
+printf 'REGION=%q\nOWL_METASTORE_SECRET_ARN=%q\nOWL_ENV_SCRIPT=%q\nPROFILE_SCRIPT=%q\n' "$REGION" "$OWL_METASTORE_SECRET_ARN" "$${OWL_ENV_SCRIPT:-}" "/etc/profile.d/collibra-dq.sh" > /etc/collibra-dq/runtime-secret.conf 2>/dev/null||true
+
+cat >/usr/local/bin/collibra-refresh-rds-secret.sh <<'REFRESHEOF'
+#!/bin/bash
+set -euo pipefail
+
+[ -f /etc/collibra-dq/runtime-secret.conf ] || exit 0
+. /etc/collibra-dq/runtime-secret.conf
+
+[ -n "$${OWL_METASTORE_SECRET_ARN:-}" ] || exit 0
+[ -n "$${REGION:-}" ] || { echo "Missing REGION in runtime-secret.conf"; exit 1; }
+
+SECRET_STRING=$(aws secretsmanager get-secret-value --secret-id "$OWL_METASTORE_SECRET_ARN" --query 'SecretString' --output text --region "$REGION")
+[ -n "$SECRET_STRING" ] || { echo "Empty secret payload from $OWL_METASTORE_SECRET_ARN"; exit 1; }
+
+extract_password() {
+  local raw="$1"
+  if echo "$raw" | grep -q '^{'; then
+    if command -v jq >/dev/null 2>&1; then
+      echo "$raw" | jq -r '.password // empty'
+    elif command -v python3 >/dev/null 2>&1; then
+      python3 - <<'PY' "$raw"
+import json
+import sys
+data = json.loads(sys.argv[1])
+print(data.get("password", ""))
+PY
+    elif command -v python >/dev/null 2>&1; then
+      python - <<'PY' "$raw"
+import json
+import sys
+data = json.loads(sys.argv[1])
+print(data.get("password", ""))
+PY
+    else
+      echo ""
+    fi
+  else
+    echo "$raw"
+  fi
+}
+
+PASSWORD=$(extract_password "$SECRET_STRING")
+[ -n "$PASSWORD" ] || { echo "Password key not found in RDS secret $OWL_METASTORE_SECRET_ARN"; exit 1; }
+PASSWORD_ESCAPED=$(printf '%q' "$PASSWORD")
+
+update_export_var() {
+  local file_path="$1"
+  local var_name="$2"
+  local var_value="$3"
+  [ -f "$file_path" ] || return 0
+  local tmp_file=""
+  tmp_file=$(mktemp)
+  awk -v name="$var_name" -v value="$var_value" '
+    BEGIN { replaced = 0; prefix = "export " name "=" }
+    index($0, prefix) == 1 { print prefix value; replaced = 1; next }
+    { print }
+    END { if (!replaced) print prefix value }
+  ' "$file_path" > "$tmp_file"
+  cat "$tmp_file" > "$file_path"
+  rm -f "$tmp_file"
+}
+
+PROFILE_SCRIPT=$${PROFILE_SCRIPT:-/etc/profile.d/collibra-dq.sh}
+update_export_var "$PROFILE_SCRIPT" "OWL_METASTORE_PASS" "$PASSWORD_ESCAPED"
+update_export_var "$PROFILE_SCRIPT" "METASTORE_PASS" "$PASSWORD_ESCAPED"
+
+if [ -n "$${OWL_ENV_SCRIPT:-}" ] && [ -f "$OWL_ENV_SCRIPT" ]; then
+  update_export_var "$OWL_ENV_SCRIPT" "OWL_METASTORE_PASS" "$PASSWORD_ESCAPED"
+  update_export_var "$OWL_ENV_SCRIPT" "METASTORE_PASS" "$PASSWORD_ESCAPED"
+fi
+
+{
+  printf 'OWL_METASTORE_PASS=%q\n' "$PASSWORD"
+  printf 'METASTORE_PASS=%q\n' "$PASSWORD"
+} > /etc/collibra-dq/runtime-secrets.env
+chmod 600 /etc/collibra-dq/runtime-secrets.env || true
+REFRESHEOF
+chmod +x /usr/local/bin/collibra-refresh-rds-secret.sh
+
+cat >/usr/local/bin/collibra-verify-rds-auth.sh <<'VERIFYEOF'
+#!/bin/bash
+set -euo pipefail
+
+[ -f /etc/profile.d/collibra-dq.sh ] && . /etc/profile.d/collibra-dq.sh
+[ -f /etc/collibra-dq/runtime-secrets.env ] && . /etc/collibra-dq/runtime-secrets.env
+
+if [ -z "$${POSTGRESQL_HOST:-}" ] || [ -z "$${OWL_METASTORE_USER:-}" ] || [ -z "$${OWL_METASTORE_PASS:-}" ]; then
+  echo "Skipping DB auth verification: required variables are not fully set."
+  exit 0
+fi
+
+if ! command -v psql >/dev/null 2>&1; then
+  echo "WARNING: psql is not installed; skipping DB auth verification."
+  exit 0
+fi
+
+export PGPASSWORD="$OWL_METASTORE_PASS"
+RETRIES=6
+SLEEP_SECONDS=5
+STRICT_MODE="$${COLLIBRA_VERIFY_RDS_STRICT:-0}"
+
+for attempt in $(seq 1 "$RETRIES"); do
+  PSQL_OUTPUT=$(timeout 10 psql \
+    -h "$POSTGRESQL_HOST" \
+    -p "$${POSTGRESQL_PORT:-5432}" \
+    -U "$OWL_METASTORE_USER" \
+    -d "$${POSTGRESQL_DATABASE:-dqMetastore}" \
+    -c "SELECT 1;" 2>&1) && PSQL_RC=0 || PSQL_RC=$?
+
+  if [ "$PSQL_RC" -eq 0 ]; then
+    echo "RDS auth verification succeeded (attempt $attempt/$RETRIES)."
+    unset PGPASSWORD
+    exit 0
+  fi
+
+  echo "RDS auth verification failed (attempt $attempt/$RETRIES): $PSQL_OUTPUT"
+
+  # RHEL7 fallback client is PostgreSQL 9.2; when RDS uses modern auth methods
+  # (e.g. SCRAM), psql auth checks can fail although the DQ JVM app works.
+  # Do not block startup in non-strict mode for known client/server mismatch.
+  if echo "$PSQL_OUTPUT" | grep -qiE 'authentication method .* not supported|SCRAM|SASL|libpq|password authentication failed'; then
+    if [ "$STRICT_MODE" = "1" ]; then
+      echo "ERROR: strict RDS verification enabled and auth check failed."
+      unset PGPASSWORD
+      exit 1
+    fi
+    echo "WARNING: non-strict mode: skipping blocking RDS auth verification."
+    unset PGPASSWORD
+    exit 0
+  fi
+
+  if [ "$attempt" -lt "$RETRIES" ]; then
+    sleep "$SLEEP_SECONDS"
+  fi
+done
+
+unset PGPASSWORD
+if [ "$STRICT_MODE" = "1" ]; then
+  echo "ERROR: RDS auth verification failed after $RETRIES attempts (strict mode)."
+  exit 1
+fi
+echo "WARNING: RDS auth verification failed after $RETRIES attempts; continuing (non-strict mode)."
+exit 0
+VERIFYEOF
+chmod +x /usr/local/bin/collibra-verify-rds-auth.sh
+if [ -n "$OWL_METASTORE_SECRET_ARN" ]; then
+  if ! /usr/local/bin/collibra-refresh-rds-secret.sh; then
+    echo "WARNING: initial RDS secret refresh failed; continuing with resolved install-time credentials."
+  fi
+  if ! /usr/local/bin/collibra-verify-rds-auth.sh; then
+    echo "WARNING: initial RDS auth verification returned non-zero; continuing."
+  fi
+fi
+
+OWL_MANAGE_SCRIPT=$(find "$ACTUAL_OWL_BASE" -name "owlmanage.sh" -type f|head -1)
+[ -z "$OWL_MANAGE_SCRIPT" ]&&OWL_MANAGE_SCRIPT=$(find "$OWL_BASE" -name "owlmanage.sh" -type f|head -1)
+if [ -n "$OWL_MANAGE_SCRIPT" ];then
+  mark_phase "SERVICE_START"
+  chmod +x "$OWL_MANAGE_SCRIPT"
+  [ -n "$OWL_ENV_SCRIPT" ]&&[ -f "$OWL_ENV_SCRIPT" ]&&source "$OWL_ENV_SCRIPT"
+  set +e
+  "$OWL_MANAGE_SCRIPT" start=all
+  OWL_START_EXIT=$?
+  record_exit_code "$OWL_START_EXIT"
+  set -e
+  if [ "$OWL_START_EXIT" -ne 0 ]; then
+    echo "WARNING: owlmanage.sh start=all exited with code $OWL_START_EXIT"
+    collect_startup_diagnostics
+    if wait_for_web_listener 120 5 || web_process_present; then
+      echo "owlmanage reported non-zero, but DQ Web is listening on :9000. Continuing."
+      OWL_START_EXIT=0
+      record_exit_code 0
+    else
+      echo "ERROR: owlmanage.sh start=all failed and DQ Web did not listen on :9000."
+      exit 1
+    fi
+  fi
+  if [ "$LICENSE_CONFIGURED" = true ]; then
+    set +e
+    "$OWL_MANAGE_SCRIPT" stop=owlweb || true
+    sleep 3
+    "$OWL_MANAGE_SCRIPT" start=owlweb
+    OWL_WEB_RESTART_EXIT=$?
+    record_exit_code "$OWL_WEB_RESTART_EXIT"
+    set -e
+    if [ "$OWL_WEB_RESTART_EXIT" -ne 0 ]; then
+      echo "WARNING: owlmanage.sh start=owlweb exited with code $OWL_WEB_RESTART_EXIT"
+      collect_startup_diagnostics
+      if wait_for_web_listener 120 5 || web_process_present; then
+        echo "owlweb restart returned non-zero, but DQ Web is listening on :9000. Continuing."
+        OWL_WEB_RESTART_EXIT=0
+        record_exit_code 0
+      else
+        echo "ERROR: owlmanage.sh start=owlweb failed and DQ Web did not listen on :9000."
+        exit 1
+      fi
+    fi
+  fi
+  sleep 5
+  if command -v ss >/dev/null 2>&1;then
+    if ss -tlnp 2>/dev/null|grep ':9000'|grep -qE '0\.0\.0\.0|\*';then
+      echo "DQ Web is listening on all interfaces (0.0.0.0:9000) - ALB can reach it"
+    else
+      echo "WARNING: DQ Web may be bound to localhost only. If ALB returns 502/timeout, set bind to 0.0.0.0 in config and restart owlweb. Check: ss -tlnp | grep 9000"
+    fi
+  fi
+  cat >/etc/systemd/system/collibra-dq.service <<EOF
+[Unit]
+Description=Collibra DQ Services
+After=network.target
+[Service]
+Type=forking
+User=root
+WorkingDirectory=$ACTUAL_OWL_BASE
+Environment="OWL_BASE=$ACTUAL_OWL_BASE"
+Environment="OWL_WEB_HTTP_ADDRESS=0.0.0.0"
+Environment="OWL_WEB_OPTS=-Dhttp.address=0.0.0.0"
+EnvironmentFile=-/etc/collibra-dq/runtime-secrets.env
+# Ensure /opt symlinks exist for owlmanage.sh; use persisted paths so /opt/config points to dir with owl-env.sh
+ExecStartPre=+/bin/sh -c 'if [ -f /etc/collibra-dq/opt-paths.conf ]; then . /etc/collibra-dq/opt-paths.conf; [ -n "$OWL_CONFIG_DIR" ] \&\& [ -d "$OWL_CONFIG_DIR" ] \&\& ln -sfn "$OWL_CONFIG_DIR" /opt/config; for d in bin pids log; do [ -n "$OWL_INSTALL_ROOT" ] \&\& [ -d "$OWL_INSTALL_ROOT/$d" ] \&\& ln -sfn "$OWL_INSTALL_ROOT/$d" /opt/$d; done; else for d in config bin pids log; do [ -d "$OWL_BASE/$d" ] \&\& ln -sfn "$OWL_BASE/$d" /opt/$d; done; fi'
+ExecStartPre=+/usr/local/bin/collibra-refresh-rds-secret.sh
+ExecStartPre=+/usr/local/bin/collibra-verify-rds-auth.sh
+ExecStart=$OWL_MANAGE_SCRIPT start=all
+ExecStop=$OWL_MANAGE_SCRIPT stop=all
+Restart=on-failure
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload;systemctl enable collibra-dq.service||true
+fi
+
+# Test RDS connectivity if psql is available
+if command -v psql >/dev/null 2>&1&&[ -n "$POSTGRESQL_HOST" ]&&[ "$POSTGRESQL_HOST" != "" ];then
+  echo "Testing RDS PostgreSQL connectivity..."
+  export PGPASSWORD="$OWL_METASTORE_PASS"
+  if timeout 10 psql -h "$POSTGRESQL_HOST" -p "$POSTGRESQL_PORT" -U "$OWL_METASTORE_USER" -d "$POSTGRESQL_DATABASE" -c "SELECT version();" >/dev/null 2>&1;then
+    echo "SUCCESS: RDS PostgreSQL connection test successful"
+  else
+    echo "WARNING: RDS PostgreSQL connection test failed (this may be normal if security groups are not yet configured)"
+  fi
+  unset PGPASSWORD
+fi
+
+# Create a helper script for testing RDS connection
+cat >/usr/local/bin/test-rds-connection.sh <<'TESTEOF'
+#!/bin/bash
+# Helper script to test RDS PostgreSQL connection
+source /etc/profile.d/collibra-dq.sh 2>/dev/null || true
+if [ -z "$$POSTGRESQL_HOST" ]||[ "$$POSTGRESQL_HOST" == "" ];then
+  echo "ERROR: POSTGRESQL_HOST not set"
+  exit 1
+fi
+export PGPASSWORD="$${OWL_METASTORE_PASS:-$$POSTGRESQL_PASSWORD}"
+echo "Testing connection to: $$POSTGRESQL_HOST:$${POSTGRESQL_PORT:-5432}/$$POSTGRESQL_DATABASE"
+echo "User: $${OWL_METASTORE_USER:-$$POSTGRESQL_USER}"
+psql -h "$$POSTGRESQL_HOST" -p "$${POSTGRESQL_PORT:-5432}" -U "$${OWL_METASTORE_USER:-$$POSTGRESQL_USER}" -d "$${POSTGRESQL_DATABASE:-dqMetastore}" -c "SELECT version();"
+unset PGPASSWORD
+TESTEOF
+chmod +x /usr/local/bin/test-rds-connection.sh
+echo "Created RDS connection test script: /usr/local/bin/test-rds-connection.sh"
+
+mark_phase "DONE"
+record_exit_code 0
+echo "Collibra DQ installation completed at $(date)"

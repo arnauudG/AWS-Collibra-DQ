@@ -1,0 +1,16 @@
+[project]
+name = "collibra-dq-starter"
+version = "0.1.5"
+description = "Collibra DQ starter orchestration CLI"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+dqctl = "collibra_dq_starter.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

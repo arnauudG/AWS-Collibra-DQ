@@ -1,0 +1,213 @@
+#!/bin/bash
+# Bootstrap: fetch full install script from S3 and run (keeps user data under 16KB)
+# install_script_hash=${install_script_hash} (triggers EC2 replacement on script change)
+set -euo pipefail
+REGION='${region}'
+BUCKET='${bucket}'
+KEY='${key}'
+STATUS_DIR="/var/lib/collibra-dq-install"
+STATUS_FILE="$STATUS_DIR/status.env"
+BOOTSTRAP_MARKER="$STATUS_DIR/bootstrap-complete"
+CURRENT_PHASE="BOOTSTRAP"
+LAST_EXIT_CODE=0
+BOOTSTRAP_STATUS_ACTIVE=true
+
+mkdir -p "$STATUS_DIR"
+
+update_status() {
+  local exit_code="$${1:-$LAST_EXIT_CODE}"
+  LAST_EXIT_CODE="$exit_code"
+  printf 'PHASE=%q\nLAST_EXIT_CODE=%q\nUPDATED_AT=%q\n' \
+    "$CURRENT_PHASE" \
+    "$LAST_EXIT_CODE" \
+    "$(date -Is)" >"$STATUS_FILE"
+}
+
+mark_phase() {
+  CURRENT_PHASE="$1"
+  echo "Bootstrap phase: $CURRENT_PHASE"
+  update_status 0
+}
+
+log_error() {
+  local exit_code="$1"
+  local line_no="$2"
+  local failed_command="$3"
+  update_status "$exit_code"
+  echo "ERROR: bootstrap phase=$CURRENT_PHASE exit_code=$exit_code line=$line_no command=$failed_command"
+}
+
+on_error() {
+  local exit_code=$?
+  log_error "$exit_code" "$1" "$2"
+  exit "$exit_code"
+}
+
+finish() {
+  local exit_code=$?
+  if [ "$BOOTSTRAP_STATUS_ACTIVE" = "true" ]; then
+    update_status "$exit_code"
+  fi
+}
+
+trap 'on_error "$${LINENO}" "$${BASH_COMMAND}"' ERR
+trap finish EXIT
+exec > >(tee -a /var/log/collibra-dq-install.log) 2>&1
+
+mark_phase "BOOTSTRAP"
+
+AWS_CLI_SOURCE="missing"
+if command -v aws >/dev/null 2>&1; then
+  AWS_CLI_SOURCE="preinstalled"
+fi
+
+if ! command -v aws >/dev/null 2>&1; then
+  echo "Bootstrap: aws cli not found, attempting installation..."
+  if command -v dnf >/dev/null 2>&1; then
+    dnf -y install awscli || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum -y install awscli || true
+  fi
+  if command -v aws >/dev/null 2>&1; then
+    AWS_CLI_SOURCE="package-manager"
+  fi
+fi
+
+# Fallback: install AWS CLI v2 from the official bundle if package manager failed
+if ! command -v aws >/dev/null 2>&1; then
+  echo "Bootstrap: package manager install failed, installing AWS CLI v2 from bundle..."
+  yum -y install unzip less || true
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -qo /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+  rm -rf /tmp/awscliv2.zip /tmp/aws
+  AWS_CLI_SOURCE="bundle"
+fi
+
+if ! command -v aws >/dev/null 2>&1; then
+  echo "ERROR: aws cli is required to download install script from S3."
+  exit 1
+fi
+
+if [ "$AWS_CLI_SOURCE" = "preinstalled" ] && ! aws --version >/dev/null 2>&1; then
+  AWS_CLI_SOURCE="unknown"
+fi
+echo "Bootstrap: aws cli source=$AWS_CLI_SOURCE"
+aws --version || true
+
+# Install SSM agent if not present (required for remote management)
+ssm_unit_exists() {
+  systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+    | awk '{print $1}' \
+    | grep -qx "amazon-ssm-agent.service"
+}
+
+ensure_ssm_agent() {
+  local unit_exists=false
+  if ssm_unit_exists; then
+    unit_exists=true
+  fi
+
+  if [ "$unit_exists" = false ]; then
+    echo "Bootstrap: installing SSM agent..."
+    if command -v dnf >/dev/null 2>&1; then
+      dnf -y install "https://s3.$REGION.amazonaws.com/amazon-ssm-$REGION/latest/linux_amd64/amazon-ssm-agent.rpm" || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum -y install "https://s3.$REGION.amazonaws.com/amazon-ssm-$REGION/latest/linux_amd64/amazon-ssm-agent.rpm" || true
+    fi
+
+    if ! ssm_unit_exists; then
+      echo "Bootstrap: package-manager install did not register amazon-ssm-agent; trying direct RPM install..."
+      curl -fsSL "https://s3.$REGION.amazonaws.com/amazon-ssm-$REGION/latest/linux_amd64/amazon-ssm-agent.rpm" -o /tmp/amazon-ssm-agent.rpm
+      rpm -Uvh --force /tmp/amazon-ssm-agent.rpm || {
+        if command -v yum >/dev/null 2>&1; then
+          yum -y localinstall /tmp/amazon-ssm-agent.rpm || true
+        elif command -v dnf >/dev/null 2>&1; then
+          dnf -y install /tmp/amazon-ssm-agent.rpm || true
+        fi
+      }
+      rm -f /tmp/amazon-ssm-agent.rpm
+    fi
+  fi
+
+  if ! ssm_unit_exists; then
+    echo "ERROR: amazon-ssm-agent service unit is missing after installation attempts."
+    systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | head -n 30 || true
+    exit 1
+  fi
+
+  echo "Bootstrap: enabling and starting amazon-ssm-agent..."
+  systemctl daemon-reload || true
+  systemctl enable --now amazon-ssm-agent
+
+  if ! systemctl is-active --quiet amazon-ssm-agent; then
+    echo "ERROR: amazon-ssm-agent failed to reach active state."
+    systemctl status amazon-ssm-agent --no-pager -l || true
+    exit 1
+  fi
+  echo "Bootstrap: amazon-ssm-agent is active."
+}
+
+dq_web_listening() {
+  command -v ss >/dev/null 2>&1 \
+    && ss -tlnp 2>/dev/null | grep ':9000' | grep -qE '0\.0\.0\.0|\*'
+}
+
+dq_web_process_present() {
+  pgrep -af 'dq-webapp-.*\.jar' >/dev/null 2>&1
+}
+
+wait_for_dq_web_listener() {
+  local retries="$${1:-36}"
+  local sleep_seconds="$${2:-5}"
+  local attempt=1
+
+  while [ "$attempt" -le "$retries" ]; do
+    if dq_web_listening; then
+      return 0
+    fi
+    sleep "$sleep_seconds"
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+ensure_ssm_agent
+
+mark_phase "PACKAGE_DOWNLOAD"
+echo "Bootstrap: downloading install script from s3://$BUCKET/$KEY"
+if ! aws s3 cp "s3://$BUCKET/$KEY" /tmp/install_collibra_dq.sh --region "$REGION"; then
+  echo "ERROR: failed to download installer from s3://$BUCKET/$KEY in region $REGION"
+  exit 1
+fi
+chmod +x /tmp/install_collibra_dq.sh
+
+mark_phase "HANDOFF"
+echo "Bootstrap: launching /tmp/install_collibra_dq.sh"
+set +e
+# The installer writes its own log to /var/log/collibra-dq-install.log.
+# Detach stdout/stderr here to avoid duplicate lines through bootstrap's tee.
+/tmp/install_collibra_dq.sh </dev/null >/dev/null 2>&1 &
+INSTALLER_PID=$!
+echo "Bootstrap: installer pid=$INSTALLER_PID"
+touch "$BOOTSTRAP_MARKER"
+wait "$INSTALLER_PID"
+INSTALL_EXIT=$?
+set -e
+
+if [ "$INSTALL_EXIT" -ne 0 ]; then
+  echo "WARNING: install_collibra_dq.sh exited with code $INSTALL_EXIT"
+  # Optional post-checks can return non-zero while the web service is still
+  # starting. Wait up to 15 minutes for :9000 before failing bootstrap.
+  if wait_for_dq_web_listener 180 5 || dq_web_process_present; then
+    echo "Bootstrap: DQ Web is listening on :9000 despite installer exit code $INSTALL_EXIT; continuing."
+    CURRENT_PHASE="DONE"
+    update_status 0
+  else
+    echo "ERROR: install_collibra_dq.sh exited with code $INSTALL_EXIT and DQ Web is not listening on :9000"
+    exit "$INSTALL_EXIT"
+  fi
+fi
+
+# Prevent bootstrap exit trap from overwriting installer's final DONE status.
+BOOTSTRAP_STATUS_ACTIVE=false

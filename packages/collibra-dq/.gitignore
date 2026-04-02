@@ -1,0 +1,9 @@
+# Ignore all package files (they're large and should not be committed)
+*.tar.gz
+*.zip
+*.tgz
+*.tar
+
+# But keep the README and this file
+!README.md
+!.gitignore

@@ -1,0 +1,1 @@
+"""Collibra DQ starter package."""
