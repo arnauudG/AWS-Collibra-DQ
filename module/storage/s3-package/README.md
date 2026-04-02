@@ -134,28 +134,10 @@ Recommended:
 
 ## ADR
 
-### ADR-M1: One generic S3 module for both shared and env-scoped storage
+Detailed ADRs live in [docs/adr/README.md](../../docs/adr/README.md).
 
-Decision:
-Use one reusable module with `create_bucket`, `local_file_path`, and `force_destroy` controls instead of separate modules for package bucket and install-script bucket.
-
-Reason:
-The underlying AWS concerns are the same; only ownership and lifecycle differ.
-
-Consequence:
-- Callers must document intended lifecycle clearly
-- Same module can be used in either shared or env-specific contexts
-
-### ADR-M2: Versioning enabled by default
-
-Decision:
-Keep versioning enabled even for package storage.
-
-Reason:
-It improves recovery and auditability for replaced artifacts.
-
-Consequence:
-- Destroy becomes more complex unless `force_destroy = true`
+- [ADR-M1](../../docs/adr/ADR-M1-generic-s3-module.md): use one generic S3 module for both shared and env-scoped storage patterns.
+- [ADR-M2](../../docs/adr/ADR-M2-versioning-enabled-by-default.md): keep versioning enabled by default and handle destroy semantics explicitly.
 
 ## IAM Policy for EC2 Access
 

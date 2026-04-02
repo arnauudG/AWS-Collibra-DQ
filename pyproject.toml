@@ -5,6 +5,12 @@ description = "Collibra DQ starter orchestration CLI"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
 [project.scripts]
 dqctl = "collibra_dq_starter.cli:main"
 
@@ -14,3 +20,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --cov=collibra_dq_starter --cov-report=term-missing --cov-fail-under=75"
+markers = [
+    "integration: local command-level integration tests",
+    "aws: AWS-backed smoke tests that are disabled by default",
+]

@@ -174,7 +174,7 @@ variable "spark_package" {
 }
 
 variable "dq_admin_user_password" {
-  description = "Password for DQ Web admin user (case-sensitive). If unset, installer falls back to EC2 instance ID."
+  description = "Password for DQ Web admin user (case-sensitive). Bootstrap-safe values must use only letters, digits, and underscore, include upper/lower/digit/underscore, and must not contain 'admin'."
   type        = string
   sensitive   = true
   default     = ""

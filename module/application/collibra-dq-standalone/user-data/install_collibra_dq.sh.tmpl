@@ -235,17 +235,23 @@ imds_get() {
 }
 
 INSTANCE_ID=$(imds_get "instance-id")
+# Collibra DQ standalone always authenticates the built-in admin UI account as "admin".
+DQ_ADMIN_UI_USERNAME="admin"
 DQ_ADMIN_USER_EMAIL="default@default.com"
+DQ_ADMIN_PASSWORD_SOURCE="provided"
+ADMIN_DEBUG_DIR="/etc/collibra-dq"
+ADMIN_DEBUG_FILE="$ADMIN_DEBUG_DIR/admin-bootstrap-debug.env"
 
 validate_admin_password_policy() {
   local password="$1"
   [ -n "$password" ] || return 1
   [ $${#password} -ge 8 ] || return 1
   [ $${#password} -le 72 ] || return 1
+  echo "$password" | grep -q '^[A-Za-z0-9_]*$' || return 1
   echo "$password" | grep -q '[A-Z]' || return 1
   echo "$password" | grep -q '[a-z]' || return 1
   echo "$password" | grep -q '[0-9]' || return 1
-  echo "$password" | grep -q '[!%&@#$^*?_~]' || return 1
+  echo "$password" | grep -q '_' || return 1
   # Collibra setup rejects passwords that include the default admin user id.
   if echo "$password" | tr '[:upper:]' '[:lower:]' | grep -q "admin"; then
     return 1
@@ -255,10 +261,10 @@ validate_admin_password_policy() {
 
 generate_compliant_admin_password() {
   local candidate=""
-  local alphabet='A-Za-z0-9!%&@#$^*?_~'
+  local alphabet='A-Za-z0-9_'
   while true; do
     candidate="$(LC_ALL=C tr -dc "$alphabet" </dev/urandom | head -c 24 || true)"
-    candidate="A9!$candidate"
+    candidate="Aa9_$candidate"
     candidate="$${candidate:0:32}"
     if validate_admin_password_policy "$candidate"; then
       printf '%s' "$candidate"
@@ -267,12 +273,62 @@ generate_compliant_admin_password() {
   done
 }
 
+hash_value_sha256() {
+  local value="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$value" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$value" | shasum -a 256 | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$value" | openssl dgst -sha256 | awk '{print $NF}'
+  else
+    printf 'unavailable'
+  fi
+}
+
+write_admin_debug_file() {
+  mkdir -p "$ADMIN_DEBUG_DIR"
+  {
+    printf 'DQ_ADMIN_UI_USERNAME=%q\n' "$DQ_ADMIN_UI_USERNAME"
+    printf 'DQ_ADMIN_PASSWORD_SOURCE=%q\n' "$DQ_ADMIN_PASSWORD_SOURCE"
+    printf 'DQ_ADMIN_PASSWORD_POLICY_VALID=%q\n' "true"
+    printf 'DQ_ADMIN_PASSWORD_LENGTH=%q\n' "$${#DQ_ADMIN_USER_PASSWORD}"
+    printf 'DQ_ADMIN_PASSWORD_SHA256=%q\n' "$(hash_value_sha256 "$DQ_ADMIN_USER_PASSWORD")"
+    printf 'SETUP_LOG=%q\n' "$SETUP_LOG"
+  } > "$ADMIN_DEBUG_FILE"
+  chmod 600 "$ADMIN_DEBUG_FILE" 2>/dev/null || true
+}
+
+emit_admin_setup_debug_summary() {
+  echo "--- Admin bootstrap debug ---"
+  echo "UI username: $DQ_ADMIN_UI_USERNAME"
+  echo "Password source: $DQ_ADMIN_PASSWORD_SOURCE"
+  echo "Password policy valid: true"
+  echo "Password length: $${#DQ_ADMIN_USER_PASSWORD}"
+  echo "Password sha256: $(hash_value_sha256 "$DQ_ADMIN_USER_PASSWORD")"
+  echo "Debug file: $ADMIN_DEBUG_FILE"
+  echo "Setup log: $SETUP_LOG"
+  echo "--- setup.sh admin/password hints (sanitized) ---"
+  if [ -f "$SETUP_LOG" ]; then
+    grep -Ein 'admin|password|email|credential|login' "$SETUP_LOG" 2>/dev/null \
+      | tail -n 40 \
+      | sed \
+          -e "s/$DQ_ADMIN_USER_PASSWORD/[REDACTED_PASSWORD]/g" \
+          -e "s/$DQ_ADMIN_USER_EMAIL/[REDACTED_EMAIL]/g" \
+      || true
+  else
+    echo "No setup log found at $SETUP_LOG"
+  fi
+}
+
 if [ -z "$DQ_ADMIN_USER_PASSWORD" ]; then
   DQ_ADMIN_USER_PASSWORD="$(generate_compliant_admin_password)"
+  DQ_ADMIN_PASSWORD_SOURCE="generated-empty"
   echo "DQ_ADMIN_USER_PASSWORD was empty; generated a compliant password for non-interactive setup."
 elif ! validate_admin_password_policy "$DQ_ADMIN_USER_PASSWORD"; then
-  echo "WARNING: Provided DQ_ADMIN_USER_PASSWORD does not match Collibra policy (8-72 chars, upper/lower/digit/special from !,% ,&,@,#,$,^,*,?,_,~, and must not contain 'admin')."
+  echo "WARNING: Provided DQ_ADMIN_USER_PASSWORD does not match the bootstrap-safe Collibra policy (8-72 chars, only letters/digits/underscore, must include upper/lower/digit/underscore, and must not contain 'admin')."
   DQ_ADMIN_USER_PASSWORD="$(generate_compliant_admin_password)"
+  DQ_ADMIN_PASSWORD_SOURCE="generated-invalid"
   echo "Generated a compliant DQ_ADMIN_USER_PASSWORD for this install run."
 fi
 
@@ -451,21 +507,34 @@ if [ -d "$OWL_BASE/owl" ];then
   echo "Package extracted to owl/ subdirectory, using $ACTUAL_OWL_BASE as base"
 fi
 
+shell_quote_single() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+write_profile_export() {
+  local variable_name="$1"
+  local variable_value="$2"
+  printf 'export %s=' "$variable_name"
+  shell_quote_single "$variable_value"
+  printf '\n'
+}
+
 {
-  printf 'export OWL_BASE=%q\n' "$ACTUAL_OWL_BASE"
-  printf 'export OWL_HOME=%q\n' "$ACTUAL_OWL_BASE"
-  printf 'export OWL_METASTORE_USER=%q\n' "$OWL_METASTORE_USER"
-  printf 'export OWL_METASTORE_PASS=%q\n' "$OWL_METASTORE_PASS"
-  printf 'export METASTORE_USER=%q\n' "$OWL_METASTORE_USER"
-  printf 'export METASTORE_PASS=%q\n' "$OWL_METASTORE_PASS"
-  printf 'export POSTGRESQL_HOST=%q\n' "$POSTGRESQL_HOST"
-  printf 'export POSTGRESQL_PORT=%q\n' "$POSTGRESQL_PORT"
-  printf 'export POSTGRESQL_DATABASE=%q\n' "$POSTGRESQL_DATABASE"
-  printf 'export SPARK_PACKAGE=%q\n' "$SPARK_PACKAGE"
-  printf 'export DQ_ADMIN_USER_PASSWORD=%q\n' "$DQ_ADMIN_USER_PASSWORD"
-  printf 'export DQ_ADMIN_USER_EMAIL=%q\n' "$DQ_ADMIN_USER_EMAIL"
-  printf 'export LICENSE_KEY=%q\n' "$LICENSE_KEY"
-  [ -n "$LICENSE_NAME" ]&&[ "$LICENSE_NAME" != "" ]&&printf 'export LICENSE_NAME=%q\n' "$LICENSE_NAME"
+  write_profile_export OWL_BASE "$ACTUAL_OWL_BASE"
+  write_profile_export OWL_HOME "$ACTUAL_OWL_BASE"
+  write_profile_export OWL_METASTORE_USER "$OWL_METASTORE_USER"
+  write_profile_export OWL_METASTORE_PASS "$OWL_METASTORE_PASS"
+  write_profile_export METASTORE_USER "$OWL_METASTORE_USER"
+  write_profile_export METASTORE_PASS "$OWL_METASTORE_PASS"
+  write_profile_export POSTGRESQL_HOST "$POSTGRESQL_HOST"
+  write_profile_export POSTGRESQL_PORT "$POSTGRESQL_PORT"
+  write_profile_export POSTGRESQL_DATABASE "$POSTGRESQL_DATABASE"
+  write_profile_export SPARK_PACKAGE "$SPARK_PACKAGE"
+  write_profile_export DQ_ADMIN_UI_USERNAME "$DQ_ADMIN_UI_USERNAME"
+  write_profile_export DQ_ADMIN_USER_PASSWORD "$DQ_ADMIN_USER_PASSWORD"
+  write_profile_export DQ_ADMIN_USER_EMAIL "$DQ_ADMIN_USER_EMAIL"
+  write_profile_export LICENSE_KEY "$LICENSE_KEY"
+  [ -n "$LICENSE_NAME" ]&&[ "$LICENSE_NAME" != "" ]&&write_profile_export LICENSE_NAME "$LICENSE_NAME"
 } > /etc/profile.d/collibra-dq.sh
 source /etc/profile.d/collibra-dq.sh
 [ -z "$DQ_ADMIN_USER_PASSWORD" ]||[ "$DQ_ADMIN_USER_PASSWORD" == "" ]&&{ echo "ERROR: DQ_ADMIN_USER_PASSWORD not set";exit 1; }
@@ -496,6 +565,7 @@ echo "Running setup.sh: SETUP_SCRIPT=$SETUP_SCRIPT PG_SERVER=$PG_SERVER"
 mark_phase "SETUP"
 SETUP_LOG="/var/log/collibra-dq-setup.log"
 rm -f "$SETUP_LOG"
+write_admin_debug_file
 set +e
 "$SETUP_SCRIPT" \
   -owlbase="$ACTUAL_OWL_BASE" \
@@ -542,6 +612,13 @@ if [ $SETUP_EXIT -ne 0 ];then
 else
   echo "setup.sh completed successfully. Full setup log: $SETUP_LOG"
 fi
+write_admin_debug_file
+emit_admin_setup_debug_summary
+
+# Cache the intended bootstrap admin credentials before any follow-up sourcing of
+# vendor-generated config files, which can overwrite DQ_ADMIN_USER_PASSWORD.
+BOOTSTRAP_DQ_ADMIN_USER_PASSWORD="$DQ_ADMIN_USER_PASSWORD"
+BOOTSTRAP_DQ_ADMIN_USER_EMAIL="$DQ_ADMIN_USER_EMAIL"
 
 OWL_ENV_SCRIPT=$(find "$ACTUAL_OWL_BASE" -name "owl-env.sh" -type f|head -1)
 [ -z "$OWL_ENV_SCRIPT" ]&&OWL_ENV_SCRIPT=$(find "$OWL_BASE" -name "owl-env.sh" -type f|head -1)
@@ -560,7 +637,8 @@ fi
 if [ -n "$OWL_ENV_SCRIPT" ]&&[ -f "$OWL_ENV_SCRIPT" ];then
   _owl_env_set() {
     local vname="$1" vval="$2"
-    local escaped=$(printf '%q' "$vval")
+    local escaped=""
+    escaped=$(shell_quote_single "$vval")
     local tmp_file=""
     tmp_file=$(mktemp)
     awk -v name="$vname" -v value="$escaped" '
@@ -576,6 +654,11 @@ if [ -n "$OWL_ENV_SCRIPT" ]&&[ -f "$OWL_ENV_SCRIPT" ];then
   _owl_env_set OWL_METASTORE_PASS "$OWL_METASTORE_PASS"
   _owl_env_set METASTORE_USER "$OWL_METASTORE_USER"
   _owl_env_set METASTORE_PASS "$OWL_METASTORE_PASS"
+  # Vendor setup.sh writes the encrypted admin password into owl-env.sh, but owl-web
+  # validates DQ_ADMIN_USER_PASSWORD as a raw password during default admin creation.
+  # Force the raw bootstrap password here so the default admin user can be seeded.
+  _owl_env_set DQ_ADMIN_USER_PASSWORD "$BOOTSTRAP_DQ_ADMIN_USER_PASSWORD"
+  _owl_env_set DQ_ADMIN_USER_EMAIL "$BOOTSTRAP_DQ_ADMIN_USER_EMAIL"
   _owl_env_set OWL_WEB_HTTP_ADDRESS "0.0.0.0"
   grep -q "http\.address" "$OWL_ENV_SCRIPT"||echo 'export OWL_WEB_OPTS="$${OWL_WEB_OPTS:-} -Dhttp.address=0.0.0.0"' >> "$OWL_ENV_SCRIPT"
 fi
@@ -650,7 +733,10 @@ PY
 
 PASSWORD=$(extract_password "$SECRET_STRING")
 [ -n "$PASSWORD" ] || { echo "Password key not found in RDS secret $OWL_METASTORE_SECRET_ARN"; exit 1; }
-PASSWORD_ESCAPED=$(printf '%q' "$PASSWORD")
+
+shell_quote_single() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
 
 update_export_var() {
   local file_path="$1"
@@ -659,7 +745,7 @@ update_export_var() {
   [ -f "$file_path" ] || return 0
   local tmp_file=""
   tmp_file=$(mktemp)
-  awk -v name="$var_name" -v value="$var_value" '
+  awk -v name="$var_name" -v value="$(shell_quote_single "$var_value")" '
     BEGIN { replaced = 0; prefix = "export " name "=" }
     index($0, prefix) == 1 { print prefix value; replaced = 1; next }
     { print }
@@ -670,17 +756,17 @@ update_export_var() {
 }
 
 PROFILE_SCRIPT=$${PROFILE_SCRIPT:-/etc/profile.d/collibra-dq.sh}
-update_export_var "$PROFILE_SCRIPT" "OWL_METASTORE_PASS" "$PASSWORD_ESCAPED"
-update_export_var "$PROFILE_SCRIPT" "METASTORE_PASS" "$PASSWORD_ESCAPED"
+update_export_var "$PROFILE_SCRIPT" "OWL_METASTORE_PASS" "$PASSWORD"
+update_export_var "$PROFILE_SCRIPT" "METASTORE_PASS" "$PASSWORD"
 
 if [ -n "$${OWL_ENV_SCRIPT:-}" ] && [ -f "$OWL_ENV_SCRIPT" ]; then
-  update_export_var "$OWL_ENV_SCRIPT" "OWL_METASTORE_PASS" "$PASSWORD_ESCAPED"
-  update_export_var "$OWL_ENV_SCRIPT" "METASTORE_PASS" "$PASSWORD_ESCAPED"
+  update_export_var "$OWL_ENV_SCRIPT" "OWL_METASTORE_PASS" "$PASSWORD"
+  update_export_var "$OWL_ENV_SCRIPT" "METASTORE_PASS" "$PASSWORD"
 fi
 
 {
-  printf 'OWL_METASTORE_PASS=%q\n' "$PASSWORD"
-  printf 'METASTORE_PASS=%q\n' "$PASSWORD"
+  printf 'OWL_METASTORE_PASS=%s\n' "$(shell_quote_single "$PASSWORD")"
+  printf 'METASTORE_PASS=%s\n' "$(shell_quote_single "$PASSWORD")"
 } > /etc/collibra-dq/runtime-secrets.env
 chmod 600 /etc/collibra-dq/runtime-secrets.env || true
 REFRESHEOF

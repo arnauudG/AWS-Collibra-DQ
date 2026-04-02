@@ -13,8 +13,8 @@ terraform {
 
 # S3 bucket for storing packages (create if it doesn't exist)
 resource "aws_s3_bucket" "package_storage" {
-  count  = var.create_bucket ? 1 : 0
-  bucket = var.bucket_name
+  count         = var.create_bucket ? 1 : 0
+  bucket        = var.bucket_name
   force_destroy = var.force_destroy
 
   tags = merge(var.tags, {

@@ -35,10 +35,10 @@ module "security_group" {
   ingress_with_cidr_blocks = [
     for cidr in var.allowed_cidr_blocks : {
       from_port   = var.port
-      to_port      = var.port
-      protocol     = "tcp"
-      description  = "Allow PostgreSQL access from CIDR ${cidr}"
-      cidr_blocks  = cidr
+      to_port     = var.port
+      protocol    = "tcp"
+      description = "Allow PostgreSQL access from CIDR ${cidr}"
+      cidr_blocks = cidr
     }
   ]
 

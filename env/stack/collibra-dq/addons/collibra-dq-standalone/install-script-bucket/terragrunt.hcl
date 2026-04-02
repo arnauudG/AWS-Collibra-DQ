@@ -12,12 +12,13 @@ include "common" {
 }
 
 locals {
-  org         = include.root.locals.org
-  env         = include.root.locals.env
-  aws_region  = include.root.locals.aws_region
-  common_tags = include.root.locals.common_tags
+  org               = include.root.locals.org
+  env               = include.root.locals.env
+  aws_region        = include.root.locals.aws_region
+  common_tags       = include.root.locals.common_tags
+  actual_account_id = include.root.locals.actual_account_id
 
-  bucket_name = "${get_aws_account_id()}-${local.org}-${local.env}-collibra-dq-packages-${local.aws_region}"
+  bucket_name = "${local.actual_account_id}-${local.org}-${local.env}-collibra-dq-packages-${local.aws_region}"
 }
 
 terraform {

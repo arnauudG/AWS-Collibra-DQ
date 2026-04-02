@@ -16,6 +16,7 @@ Infrastructure as Code (IaC) package for deploying **Collibra DQ (Standalone)** 
 - [Operational Runbook](#operational-runbook)
 - [Components](#components)
 - [Architecture Decision Records (ADR)](#architecture-decision-records-adr)
+- [Testing Strategy](#testing-strategy)
 - [Troubleshooting](#troubleshooting)
 - [Security Notes](#security-notes)
 - [Contributing](#contributing)
@@ -198,7 +199,7 @@ All runtime configuration is environment-driven.
 | Variable | Description |
 |----------|-------------|
 | `COLLIBRA_DQ_PACKAGE_URL` | Optional override package artifact URL (`s3://...` or `https://...`). If unset, orchestrator resolves shared artifact S3 URL automatically. |
-| `COLLIBRA_DQ_ADMIN_PASSWORD` | Admin password (case-sensitive). Must be 8-72 chars with upper/lower/digit/special and must not contain `admin`; if unset/invalid, installer auto-generates a compliant password for non-interactive setup. |
+| `COLLIBRA_DQ_ADMIN_PASSWORD` | Password for the built-in Collibra DQ UI admin account `admin` (case-sensitive). For bootstrap compatibility it must be 8-72 chars, use only letters/digits/underscore, include upper/lower/digit/underscore, and must not contain `admin`; if unset/invalid, installer auto-generates a compliant password for non-interactive setup. |
 | `COLLIBRA_DQ_AMI_ID` | Override EC2 AMI ID directly. If unset, CLI auto-resolves latest RHEL 7.9 AMI per region. |
 | `COLLIBRA_DQ_ENABLE_STANDALONE_HOOK` | Enables direct-standalone after-hook to auto-reconcile ALB target attachment (`false` by default; not needed for orchestrated full deploy). |
 | `COLLIBRA_DQ_ENABLE_ROTATION_RESTART` | Enable EventBridge->SSM restart on RDS secret rotation (`true` by default) |
@@ -206,12 +207,21 @@ All runtime configuration is environment-driven.
 | `COLLIBRA_DQ_ROTATION_ALARM_ACTIONS` | Comma-separated alarm action ARNs (for example SNS topics) |
 | `COLLIBRA_DQ_ROTATION_OK_ACTIONS` | Comma-separated OK action ARNs |
 
+Admin credential lifecycle note:
+- `COLLIBRA_DQ_ADMIN_PASSWORD` is guaranteed only for the first successful install against a fresh Collibra DQ metastore.
+- Re-running `deploy --target addon` against an already-existing environment does not reset the UI admin account stored in the existing metastore.
+- `destroy --target addon` followed by `deploy --target addon` does recreate the RDS metastore in the current implementation, so the injected password should be seeded again.
+- `destroy --target all` followed by `deploy --target full` remains the most explicit full-environment rebuild path.
+- The packaged Collibra `setup.sh` writes an encrypted admin password into `owl-env.sh`; this project now overrides that vendor behavior with the raw bootstrap password before `owl-web` starts, otherwise default admin creation can fail with a false `>72 characters` validation error.
+- The override must use the cached bootstrap password captured immediately after `setup.sh` returns, because re-sourcing vendor-generated `owl-env.sh` can blank or replace the admin password variable in the current shell.
+
 ### Collibra / Owl terminology mapping
 
 - `Owl DQ` and `Collibra DQ` are equivalent in this project.
 - `OWL_BASE` and `OWL_HOME` refer to the same install directory.
 - `METASTORE_USER`/`METASTORE_PASS` correspond to `OWL_METASTORE_USER`/`OWL_METASTORE_PASS`.
 - Username and password values are case-sensitive.
+- The Collibra DQ UI login username is `admin`. The installer also records an admin email for setup, but that email is not the UI username.
 - License activation only requires `COLLIBRA_DQ_LICENSE_KEY`; expiration date is not used in this workflow.
 - RDS master password is managed by AWS Secrets Manager and refreshed on app restart/start; rotation can also trigger restart automatically.
 - Rotation guardrails create CloudWatch alarms for EventBridge target failures and failed SSM restart commands.
@@ -465,6 +475,61 @@ curl -I "http://$ALB_DNS/"
 
 Expected: HTTP `302` redirect to `/login` or HTTP `200`.
 
+Retrieve the effective UI credentials from the instance when needed:
+
+```bash
+export REGION="eu-west-1"
+export INSTANCE_ID="$(cd env/stack/collibra-dq/addons/collibra-dq-standalone && terragrunt output -raw instance_id)"
+
+CMD_ID=$(aws ssm send-command \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["bash -lc '\''eval \"$(grep \"^export DQ_ADMIN_UI_USERNAME=\" /etc/profile.d/collibra-dq.sh)\"; eval \"$(grep \"^export DQ_ADMIN_USER_PASSWORD=\" /etc/profile.d/collibra-dq.sh)\"; printf \"LOGIN_USER=%s\nLOGIN_PASSWORD=%s\n\" \"$DQ_ADMIN_UI_USERNAME\" \"$DQ_ADMIN_USER_PASSWORD\"'\''"]' \
+  --query "Command.CommandId" \
+  --output text)
+
+sleep 3
+
+aws ssm get-command-invocation \
+  --region "$REGION" \
+  --command-id "$CMD_ID" \
+  --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' \
+  --output text
+```
+
+Expected login username: `admin`
+
+If a fresh rebuild still cannot authenticate, inspect the admin bootstrap debug artifacts on the instance:
+
+```bash
+export REGION="eu-west-1"
+export INSTANCE_ID="$(cd env/stack/collibra-dq/addons/collibra-dq-standalone && terragrunt output -raw instance_id)"
+
+CMD_ID=$(aws ssm send-command \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["bash -lc '\''echo \"--- /etc/collibra-dq/admin-bootstrap-debug.env ---\"; cat /etc/collibra-dq/admin-bootstrap-debug.env; echo; echo \"--- tail -n 120 /var/log/collibra-dq-setup.log ---\"; tail -n 120 /var/log/collibra-dq-setup.log'\''"]' \
+  --query "Command.CommandId" \
+  --output text)
+
+sleep 3
+
+aws ssm get-command-invocation \
+  --region "$REGION" \
+  --command-id "$CMD_ID" \
+  --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' \
+  --output text
+```
+
+What to look for:
+- `DQ_ADMIN_PASSWORD_SOURCE=provided` means the supplied password passed local validation and was handed to `setup.sh`.
+- `generated-empty` or `generated-invalid` means the installer replaced your input before initialization.
+- The `setup.sh` tail and the sanitized admin/password hints show whether Collibra reported any password, login, or credential-related rejection during initial setup.
+
 ### 7) Interpret bootstrap status correctly
 
 Use this precedence when values disagree:
@@ -516,134 +581,36 @@ Creates and manages stack backend resources:
 
 ## Architecture Decision Records (ADR)
 
-### ADR-001: CLI-first orchestration
+Detailed ADRs live under [docs/adr/README.md](docs/adr/README.md). This section keeps the short operator summary.
 
-Context:
-Deploy/destroy spans backend bootstrap, shared storage, network, database, compute, ALB, and post-deploy recovery logic. Plain Terragrunt stacks alone do not express all runtime safety checks and retries cleanly.
+- [ADR-001](docs/adr/ADR-001-cli-first-orchestration.md): use the Python CLI as the primary control plane over raw Terragrunt.
+- [ADR-002](docs/adr/ADR-002-environment-driven-configuration.md): prefer environment-driven configuration over per-client repo variants.
+- [ADR-003](docs/adr/ADR-003-stack-scoped-backend.md): keep Terraform backend resources stack-scoped.
+- [ADR-004](docs/adr/ADR-004-shared-artifact-and-install-script-buckets.md): split shared package storage from env-specific rendered install scripts.
+- [ADR-005](docs/adr/ADR-005-cost-optimized-dev-defaults.md): optimize dev defaults for cost while preserving valid ALB/RDS topology.
+- [ADR-006](docs/adr/ADR-006-http-only-alb-by-default.md): keep HTTP as the default ALB ingress path.
+- [ADR-007](docs/adr/ADR-007-standalone-hook-opt-in.md): make the standalone target-attachment hook opt-in.
+- [ADR-008](docs/adr/ADR-008-service-health-over-bootstrap-status.md): treat service health as the operational source of truth.
 
-Decision:
-Use a Python CLI (`collibra_dq_starter.cli`) as the primary control plane and let it call Terragrunt in explicit order.
+## Testing Strategy
 
-Rationale:
-This centralizes retry behavior, bucket purge fallback, bootstrap recovery, package upload checks, and environment validation in one place.
+Detailed proposed coverage lives in [docs/testing-strategy.md](docs/testing-strategy.md).
 
-Consequences:
-- Operators should prefer `uv run --no-editable python -m collibra_dq_starter.cli ...`
-- Direct Terragrunt use remains possible for debugging, but is not the primary operating model
+High-priority coverage areas are:
 
-### ADR-002: Environment-driven configuration over per-client files
+- unit tests for CLI parsing, environment validation, command execution, and naming helpers
+- regression tests for versioned S3 bucket destroy, bootstrap backend false-negatives, install-script bucket recovery, and standalone hook behavior
+- integration tests for Terragrunt/Terraform validation, full deploy smoke, standalone replacement, and `destroy --target all`
 
-Context:
-This package is meant to be reused across accounts, environments, and customers without maintaining divergent code branches.
+Current local test command:
 
-Decision:
-Use environment variables (`TF_VAR_*`, `TG_*`, `COLLIBRA_*`) as the main configuration interface.
+```bash
+python -m pytest
+```
 
-Rationale:
-This reduces repo sprawl, keeps CI/CD integration simple, and supports secure secret injection from external stores.
+Current enforced local coverage gate: `75%`
 
-Consequences:
-- Documentation must clearly separate required, optional, and override variables
-- Runtime behavior depends on operator discipline and environment hygiene
-
-### ADR-003: Stack-scoped backend
-
-Context:
-Terraform state is highly sensitive and operationally critical. Sharing state backends across unrelated stacks increases blast radius and teardown complexity.
-
-Decision:
-Create dedicated backend resources per stack/environment (`bootstrap` S3 + DynamoDB).
-
-Rationale:
-This isolates failure domains and makes full teardown possible without affecting other projects.
-
-Consequences:
-- Bootstrap must be created before the rest of the stack
-- Full destroy must handle backend deletion as a special case
-
-### ADR-004: Shared artifact bucket plus per-environment install-script bucket
-
-Context:
-The large Collibra package artifact is environment-agnostic, while the rendered install script contains environment-specific values and secrets.
-
-Decision:
-Use two S3 bucket roles:
-- shared artifact bucket for reusable package payloads
-- per-environment install-script bucket for rendered bootstrap/install script
-
-Rationale:
-This avoids re-uploading the large package for every environment while keeping environment-specific script content isolated.
-
-Consequences:
-- `COLLIBRA_DQ_PACKAGE_URL` is optional in normal flow
-- package lifecycle and install-script lifecycle are intentionally separate
-
-### ADR-005: Cost-optimized dev defaults
-
-Context:
-The primary near-term usage is development and validation, not production-scale resilience.
-
-Decision:
-Default dev to a reduced-cost topology:
-- one VPC
-- minimum valid subnet footprint
-- single NAT gateway
-- single-AZ RDS
-
-Rationale:
-This keeps iteration cost acceptable while preserving the minimum AWS topology required by ALB and RDS.
-
-Consequences:
-- Dev is not equivalent to prod HA posture
-- Documentation must call out where prod should diverge
-
-### ADR-006: HTTP-only ALB by default
-
-Context:
-HTTPS requires certificate lifecycle, ACM ownership, and domain decisions that are not always available during initial environment bring-up.
-
-Decision:
-Default the ALB to HTTP listener only.
-
-Rationale:
-This removes certificate dependencies from baseline deployment and shortens time-to-first-working-environment.
-
-Consequences:
-- Operators must use `http://<alb-dns>/` unless they explicitly add HTTPS
-- Browser “refused to connect” on `https://` is expected in default configuration
-
-### ADR-007: Direct standalone hook is opt-in
-
-Context:
-Automatic target re-attachment is helpful during direct standalone applies, but can interfere with orchestrated full-stack deploy if ALB outputs are not ready yet.
-
-Decision:
-Keep the direct standalone `after_hook` disabled by default and require `COLLIBRA_DQ_ENABLE_STANDALONE_HOOK=true` to enable it.
-
-Rationale:
-Full deploy already owns target-group attachment in module order. The hook is only needed for targeted standalone-only workflows.
-
-Consequences:
-- Full deploy remains stable
-- Direct module operators still have an automation path when they explicitly choose it
-
-### ADR-008: Service health over bootstrap status
-
-Context:
-Cloud-init/bootstrap can report `PHASE=HANDOFF` and non-zero exit codes even when the application is already serving traffic and ALB health is good.
-
-Decision:
-Treat runtime service signals as the source of truth:
-- ALB target healthy
-- process listening on `:9000`
-- local HTTP probe returns `200` or `302`
-
-Rationale:
-This matches actual platform usability better than cloud-init exit state alone.
-
-Consequences:
-- Runbooks explicitly distinguish blocking vs non-blocking bootstrap warnings
-- Operators should not destroy/rebuild solely because `status.env` is non-zero if service health is confirmed
+AWS smoke tests remain opt-in and are documented in [docs/testing-strategy.md](docs/testing-strategy.md).
 
 ## Troubleshooting
 
@@ -748,6 +715,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for branching strategy, commit style, and
 | [env/README.md](env/README.md) | Terragrunt directory overview |
 | [env/stack/README.md](env/stack/README.md) | live stack map |
 | [env/stack/collibra-dq/README.md](env/stack/collibra-dq/README.md) | stack-specific details |
+| [docs/adr/README.md](docs/adr/README.md) | full architecture decision record catalog |
+| [docs/testing-strategy.md](docs/testing-strategy.md) | proposed unit, regression, and integration test coverage |
 | [module/application/collibra-dq-standalone/README.md](module/application/collibra-dq-standalone/README.md) | standalone module behavior and startup semantics |
 | [packages/README.md](packages/README.md) | installer package location |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | process and release guidance |

@@ -107,29 +107,11 @@ For standard operations, prefer the CLI so dependency order and safety checks re
 
 ## ADR Summary
 
-### ADR-S1: Lifecycle domains are separated by ownership
+Detailed ADRs live in [docs/adr/README.md](../../docs/adr/README.md).
 
-Decision:
-Keep backend, shared artifacts, infra, and app addons in separate folders and separate Terragrunt roots.
-
-Reason:
-This supports selective deploy/destroy and limits blast radius during repairs.
-
-### ADR-S2: Orchestrated CLI is the default operating model
-
-Decision:
-Document direct Terragrunt as advanced-only and make CLI-driven operation the default path.
-
-Reason:
-The CLI carries recovery logic that raw Terragrunt does not.
-
-### ADR-S3: Full deploy owns attachment ordering
-
-Decision:
-Treat `alb/target-group-attachment` as an explicit lifecycle step in orchestrated deploy rather than relying solely on local hooks.
-
-Reason:
-This avoids race conditions between EC2 and ALB output availability.
+- [ADR-S1](../../docs/adr/ADR-S1-lifecycle-domains-by-ownership.md): keep lifecycle domains separate by ownership and blast radius.
+- [ADR-S2](../../docs/adr/ADR-S2-cli-default-operating-model.md): treat the CLI as the default operating model and Terragrunt as advanced-only.
+- [ADR-S3](../../docs/adr/ADR-S3-full-deploy-owns-attachment-ordering.md): keep target-group attachment as an explicit ordered deploy step.
 
 ## Recovery Runbook (Direct Terragrunt)
 

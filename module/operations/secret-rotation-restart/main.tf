@@ -9,7 +9,7 @@ terraform {
 }
 
 locals {
-  ssm_document_arn = "arn:aws:ssm:${var.region}::document/AWS-RunShellScript"
+  ssm_document_arn           = "arn:aws:ssm:${var.region}::document/AWS-RunShellScript"
   rotation_target_alarm_name = substr("${var.name}-rotation-target-failures", 0, 255)
   restart_command_alarm_name = substr("${var.name}-restart-command-failures", 0, 255)
 }

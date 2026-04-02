@@ -114,6 +114,15 @@ Common variables are documented in root `README.md`. Stack-specific variables to
 
 ## Verification Runbook
 
+Collibra DQ UI login uses the built-in username `admin`. Do not attempt to sign in with the setup email value persisted on the instance.
+
+Credential lifecycle:
+- The password supplied through `COLLIBRA_DQ_ADMIN_PASSWORD` is only guaranteed during the first successful install against a fresh metastore.
+- Re-running `deploy --target addon` against an already-existing environment does not reset the existing UI admin account because the same RDS metastore is reused.
+- `destroy --target addon` followed by `deploy --target addon` recreates the RDS metastore in the current orchestrator ordering, so it should reseed the admin account from current inputs.
+- `destroy --target all` followed by `deploy --target full` is still the clearest full-environment rebuild path.
+- A vendor quirk in the packaged `setup.sh` exports the encrypted admin password into `owl-env.sh`; this stack overrides that file after setup so `owl-web` receives the raw bootstrap password and can create the `admin` user.
+
 Retrieve ALB DNS:
 
 ```bash
@@ -142,6 +151,61 @@ If `addons/collibra-dq-standalone` was replaced:
 - direct standalone-only apply can use the after-hook when explicitly enabled with `COLLIBRA_DQ_ENABLE_STANDALONE_HOOK=true`
 
 Use the command below as fallback when needed.
+
+Retrieve the effective UI credentials directly from the instance:
+
+```bash
+export REGION="${TF_VAR_region:-eu-west-1}"
+cd env/stack/collibra-dq/addons/collibra-dq-standalone
+export INSTANCE_ID="$(terragrunt output -raw instance_id)"
+
+CMD_ID=$(aws ssm send-command \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["bash -lc '\''eval \"$(grep \"^export DQ_ADMIN_UI_USERNAME=\" /etc/profile.d/collibra-dq.sh)\"; eval \"$(grep \"^export DQ_ADMIN_USER_PASSWORD=\" /etc/profile.d/collibra-dq.sh)\"; printf \"LOGIN_USER=%s\nLOGIN_PASSWORD=%s\n\" \"$DQ_ADMIN_UI_USERNAME\" \"$DQ_ADMIN_USER_PASSWORD\"'\''"]' \
+  --query "Command.CommandId" \
+  --output text)
+
+sleep 3
+
+aws ssm get-command-invocation \
+  --region "$REGION" \
+  --command-id "$CMD_ID" \
+  --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' \
+  --output text
+```
+
+If a fresh rebuild still fails to authenticate, inspect the admin bootstrap debug file and setup log:
+
+```bash
+export REGION="${TF_VAR_region:-eu-west-1}"
+cd env/stack/collibra-dq/addons/collibra-dq-standalone
+export INSTANCE_ID="$(terragrunt output -raw instance_id)"
+
+CMD_ID=$(aws ssm send-command \
+  --region "$REGION" \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --parameters 'commands=["bash -lc '\''echo \"--- /etc/collibra-dq/admin-bootstrap-debug.env ---\"; cat /etc/collibra-dq/admin-bootstrap-debug.env; echo; echo \"--- tail -n 120 /var/log/collibra-dq-setup.log ---\"; tail -n 120 /var/log/collibra-dq-setup.log'\''"]' \
+  --query "Command.CommandId" \
+  --output text)
+
+sleep 3
+
+aws ssm get-command-invocation \
+  --region "$REGION" \
+  --command-id "$CMD_ID" \
+  --instance-id "$INSTANCE_ID" \
+  --query 'StandardOutputContent' \
+  --output text
+```
+
+Interpretation:
+- `DQ_ADMIN_PASSWORD_SOURCE=provided` means the input password passed installer validation and was handed to Collibra setup.
+- `generated-empty` or `generated-invalid` means the installer replaced the requested password before setup.
+- Review the setup log tail for any Collibra-side rejection or lockout-related messages.
 
 ### Post-replacement critical sequence (fallback)
 
@@ -253,53 +317,17 @@ If all three are true, treat cloud-init bootstrap failure as non-blocking and co
 
 ## Architecture Decision Records (ADR)
 
-### ADR-C1: Standalone EC2 deployment model
+Detailed ADRs live in [docs/adr/README.md](../../../docs/adr/README.md).
 
-Decision:
-Deploy Collibra DQ as a single standalone EC2 workload instead of introducing container orchestration.
-
-Reason:
-This matches the current product packaging and keeps the platform operationally simple.
-
-Consequence:
-- Scaling and HA are limited compared to distributed/containerized models
-
-### ADR-C2: Shared package artifact, env-specific rendered script
-
-Decision:
-Store the heavy package once in shared artifact storage, but keep rendered install bootstrap script per environment.
-
-Reason:
-The package is reusable, but the rendered script contains environment-specific runtime values.
-
-Consequence:
-- Shared artifact lifecycle differs from env-specific install-script lifecycle
-
-### ADR-C3: HTTP-first ingress
-
-Decision:
-Expose default ingress on HTTP only.
-
-Reason:
-Certificate management should not block baseline environment deployment.
-
-Consequence:
-- Operators must use `http://<alb-dns>/` in the default stack
-- HTTPS must be added intentionally later
-
-### ADR-C4: Health-driven acceptance
-
-Decision:
-Accept the environment as operational based on ALB target health and local app readiness rather than cloud-init success alone.
-
-Reason:
-Bootstrap can report non-zero exit state even when the service is usable.
-
-Consequence:
-- Runbooks and troubleshooting prioritize service health over bootstrap status files
+- [ADR-C1](../../../docs/adr/ADR-C1-standalone-ec2-deployment-model.md): keep the current standalone EC2 deployment model.
+- [ADR-C2](../../../docs/adr/ADR-C2-shared-package-and-env-script.md): separate reusable package artifacts from env-specific rendered scripts.
+- [ADR-C3](../../../docs/adr/ADR-C3-http-first-ingress.md): keep HTTP as the default ingress path.
+- [ADR-C4](../../../docs/adr/ADR-C4-health-driven-acceptance.md): accept runtime health over bootstrap exit state.
 
 ## Related Docs
 
 - Root product guide: [README.md](../../../README.md)
 - Stack overview: [env/stack/README.md](../README.md)
+- ADR catalog: [docs/adr/README.md](../../../docs/adr/README.md)
+- Testing strategy: [docs/testing-strategy.md](../../../docs/testing-strategy.md)
 - Package artifact details: [packages/collibra-dq/README.md](../../../packages/collibra-dq/README.md)

@@ -52,6 +52,7 @@ module "collibra_dq" {
   # owl_metastore_pass_ssm_parameter = "/acme/dev/collibra/rds-password"
 
   # Collibra DQ configuration
+  # UI login uses the built-in username "admin".
   # If dq_admin_user_password is empty, installer generates a compliant password.
   dq_admin_user_password = var.COLLIBRA_DQ_ADMIN_PASSWORD
   license_key           = var.COLLIBRA_DQ_LICENSE_KEY
@@ -96,7 +97,7 @@ module "collibra_dq" {
 | `postgresql_port` | PostgreSQL port | `number` | `5432` |
 | `postgresql_database` | PostgreSQL database name | `string` | `"dqMetastore"` |
 | `spark_package` | Spark package filename | `string` | `"spark-3.5.6-bin-hadoop3.tgz"` |
-| `dq_admin_user_password` | Password for DQ Web admin user (case-sensitive). Must be 8-72 chars with upper/lower/digit/special and must not contain `admin`; if empty/invalid, installer auto-generates a compliant value | `string` | `""` |
+| `dq_admin_user_password` | Password for DQ Web built-in admin user `admin` (case-sensitive). For bootstrap compatibility it must be 8-72 chars, use only letters/digits/underscore, include upper/lower/digit/underscore, and must not contain `admin`; if empty/invalid, installer auto-generates a compliant value | `string` | `""` |
 | `dq_package_url` | Signed link/URL to full Collibra DQ package | `string` | `""` |
 | `dq_package_filename` | Filename of the DQ package | `string` | `"dq-full-package.tar.gz"` |
 | `license_name` | Collibra DQ license name | `string` | `""` |
@@ -111,6 +112,11 @@ module "collibra_dq" {
 | `associate_public_ip_address` | Associate public IP address | `bool` | `false` |
 | `metadata_options` | Instance metadata options | `object` | IMDSv2 enforced |
 | `tags` | Tags to apply to resources | `map(string)` | `{}` |
+
+Admin credential lifecycle:
+- `dq_admin_user_password` seeds the built-in UI user `admin` only on the first successful install against a fresh Collibra DQ metastore.
+- Re-running the standalone deploy against an already-existing metastore does not reset the existing admin password stored in the database.
+- If the metastore is destroyed and recreated, the admin password is seeded again from the current Terraform input value.
 
 ## Outputs
 

@@ -17,7 +17,7 @@ locals {
   common_tags        = include.root.locals.common_tags
   collibra_dq_config = include.root.locals.collibra_dq_config
   package_config     = include.root.locals.package_config
-  account_id         = get_aws_account_id()
+  account_id         = include.root.locals.actual_account_id
 
   # Collibra DQ configuration from environment variables
   owl_base               = get_env("COLLIBRA_DQ_OWL_BASE", "/opt/collibra-dq")
@@ -31,7 +31,7 @@ locals {
   # Shared artifact bucket (env-independent, holds DQ package)
   artifact_bucket_name = local.package_config.artifact_bucket_name
   # Per-env bucket for install script (env-specific, contains rendered secrets)
-  install_script_bucket_name = "${get_aws_account_id()}-${local.org}-${local.env}-collibra-dq-packages-${local.aws_region}"
+  install_script_bucket_name = "${local.account_id}-${local.org}-${local.env}-collibra-dq-packages-${local.aws_region}"
 
   runtime_secret_parameters = compact([
     get_env("COLLIBRA_DQ_RDS_PASSWORD_SSM_PARAMETER", ""),
