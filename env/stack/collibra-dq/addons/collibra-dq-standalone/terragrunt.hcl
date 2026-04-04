@@ -147,9 +147,10 @@ inputs = {
   # Override directly via COLLIBRA_DQ_AMI_ID.
   ami = local.ami_id_override
 
-  # Network configuration - private subnet, access via ALB
-  subnet_id                   = dependency.vpc.outputs.private_subnets[0]
-  associate_public_ip_address = false
+  # Network configuration — public subnet in dev saves ~$55/mo (no NAT/VPC endpoints needed).
+  # Prod always uses private subnet. Override with TG_COLLIBRA_DQ_PUBLIC_SUBNET=false.
+  subnet_id                   = local.collibra_dq_config.use_public_subnet ? dependency.vpc.outputs.public_subnets[0] : dependency.vpc.outputs.private_subnets[0]
+  associate_public_ip_address = local.collibra_dq_config.use_public_subnet
   vpc_security_group_ids      = [dependency.sg_collibra_dq.outputs.security_group_id]
 
   # Storage configuration

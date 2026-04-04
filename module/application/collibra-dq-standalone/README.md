@@ -1,15 +1,3 @@
----
-tags: []
-
-category: Documentation
-type: data/readme
-complexity: intermediate
-time_required: 15-30 minutes
-created: 2026-02-18
-status: active
-last_updated: 2026-04-01
----
-
 # Collibra DQ Standalone Module
 
 Creates an EC2 instance running Collibra Data Quality as a standalone installation.
@@ -133,8 +121,8 @@ Admin credential lifecycle:
 
 ## Security Considerations
 
-- Instance is deployed in a private subnet (no public IP)
-- Access via Application Load Balancer (HTTPS recommended)
+- Prod: instance is deployed in a private subnet (no public IP). Dev: public subnet by default for cost savings (override with `TG_COLLIBRA_DQ_PUBLIC_SUBNET=false`)
+- Access via Application Load Balancer (HTTP by default; HTTPS requires ACM + listener config)
 - IMDSv2 is enforced (http_tokens = "required")
 - Storage is encrypted at rest
 - SSM Session Manager for administrative access (no SSH)
@@ -143,16 +131,16 @@ Admin credential lifecycle:
 
 ## Cost Implications
 
-| Resource | Dev (m5.xlarge) | Prod (m5.2xlarge) |
-|----------|-----------------|-------------------|
-| EC2 Instance (On-Demand) | ~$140/month | ~$280/month |
+| Resource | Dev (m5.large) | Prod (m5.xlarge) |
+|----------|----------------|------------------|
+| EC2 Instance (On-Demand) | ~$70/month | ~$140/month |
 | EBS Volume (100GB gp3) | ~$8/month | ~$8/month |
 | Data Transfer | Variable | Variable |
 
-**Instance Type Recommendations:**
-- **Minimum**: m5.xlarge (4 vCPU, 16GB RAM)
-- **Recommended**: m5.2xlarge (8 vCPU, 32GB RAM) for production workloads
-- **High Performance**: m5.4xlarge or r5.2xlarge for large datasets
+**Instance Type Defaults (from `root.hcl`):**
+- **Dev**: m5.large (2 vCPU, 8GB RAM)
+- **Prod**: m5.xlarge (4 vCPU, 16GB RAM)
+- Override with `TG_COLLIBRA_DQ_INSTANCE_TYPE`
 
 ## Dependencies
 

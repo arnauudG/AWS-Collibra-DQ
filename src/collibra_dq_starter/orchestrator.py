@@ -6,9 +6,10 @@ import re
 import shutil
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from .shell import CommandError, CommandResult, run
 
@@ -18,7 +19,9 @@ DestroyTarget = Literal["addon", "stack", "package", "all"]
 STACK = "collibra-dq"
 
 ALLOWED_ENVS = {"dev", "prod"}
-ALLOWED_REGIONS = {"eu-west-1", "us-east-1", "eu-central-1"}
+_AWS_REGION_PATTERN = re.compile(
+    r"^[a-z]{2}(-[a-z]+-\d+|-(gov|iso|isob)-[a-z]+-\d+)$"
+)
 
 NON_INTERACTIVE_ENV = {"TF_INPUT": "0", "TG_INPUT": "0"}
 
@@ -46,6 +49,39 @@ ADDON_DEPLOY_ORDER = [
 PACKAGE_DEPLOY_ORDER = [
     ("addons/collibra-dq-standalone/package-upload", "Package Upload (S3)"),
 ]
+
+# Dependency-aware stages for addon modules.
+# Modules within a stage have no mutual dependencies and can run in parallel.
+ADDON_STAGES: list[list[tuple[str, str]]] = [
+    [  # Stage 1: only need VPC/bootstrap
+        ("addons/collibra-dq-standalone/install-script-bucket", "Install Script Bucket"),
+        ("addons/collibra-dq-standalone/alb/sg-alb", "ALB Security Group"),
+    ],
+    [  # Stage 2: sg-collibra-dq depends on sg-alb
+        ("addons/collibra-dq-standalone/sg-collibra-dq", "Collibra DQ Security Group"),
+    ],
+    [  # Stage 3: sg-rds depends on sg-collibra-dq
+        ("database/rds-collibra-dq/sg-rds", "RDS Security Group"),
+    ],
+    [  # Stage 4: rds depends on sg-rds
+        ("database/rds-collibra-dq/rds", "RDS PostgreSQL Database"),
+    ],
+    [  # Stage 5: EC2 depends on RDS + SGs
+        ("addons/collibra-dq-standalone", "Collibra DQ EC2 Instance"),
+    ],
+    [  # Stage 6: rotation-restart and alb are independent of each other
+        ("addons/collibra-dq-standalone/rotation-restart", "RDS Rotation Restart Hook"),
+        ("addons/collibra-dq-standalone/alb", "Application Load Balancer"),
+    ],
+    [  # Stage 7: target-group-attachment depends on ALB + EC2
+        ("addons/collibra-dq-standalone/alb/target-group-attachment", "Target Group Attachment"),
+    ],
+]
+
+# Verify stages flatten to the same sequence as the flat list
+assert [m for stage in ADDON_STAGES for m in stage] == ADDON_DEPLOY_ORDER, (
+    "ADDON_STAGES and ADDON_DEPLOY_ORDER are out of sync"
+)
 
 ROOT_ENV_VAR = "COLLIBRA_DQ_STARTER_ROOT"
 DEFAULT_PACKAGE_FILENAME = "dq-2025.11-SPARK356-JDK17-package-full.tar"
@@ -138,10 +174,10 @@ def _require_core_env() -> tuple[str, str, str]:
         raise RuntimeError(
             f"Invalid TF_VAR_environment: {environment} (allowed: dev|prod)"
         )
-    if region not in ALLOWED_REGIONS:
+    if not _AWS_REGION_PATTERN.match(region):
         raise RuntimeError(
-            "Invalid TF_VAR_region: "
-            f"{region} (allowed: eu-west-1|us-east-1|eu-central-1)"
+            f"Invalid TF_VAR_region: {region} "
+            "(must match AWS region format, e.g. eu-west-1, us-east-1, ap-southeast-2)"
         )
     return environment, region, org
 
@@ -456,59 +492,17 @@ def _terragrunt_output_exists(module_path: str) -> bool:
     return bool(decoded)
 
 
-def _terragrunt_apply(module_path: str, module_name: str) -> None:
+def _terragrunt_apply(
+    module_path: str,
+    module_name: str,
+    extra_env: dict[str, str] | None = None,
+) -> None:
     module_dir = _module_dir(module_path)
     if not module_dir.is_dir():
         raise RuntimeError(f"Module directory not found: {module_dir}")
 
     info(f"Deploying {module_name}...")
-    apply_result = run(
-        ["terragrunt", "apply", "--auto-approve", "--non-interactive"],
-        cwd=module_dir,
-        check=False,
-        env=NON_INTERACTIVE_ENV,
-    )
-    _print_result_output(apply_result)
-    if apply_result.returncode == 0:
-        ok(f"{module_name} deployed.")
-        return
-
-    combined = f"{apply_result.stdout}\n{apply_result.stderr}"
-    retryable = (
-        "Required plugins are not installed" in combined
-        or "terraform init" in combined
-    )
-    if not retryable:
-        raise CommandError(f"Failed to deploy {module_name}.\n{combined}")
-
-    warn(f"{module_name}: provider init required, retrying with terragrunt init -upgrade.")
-    init_result = run(
-        ["terragrunt", "init", "-upgrade", "--non-interactive"],
-        cwd=module_dir,
-        check=False,
-        env=NON_INTERACTIVE_ENV,
-    )
-    _print_result_output(init_result)
-    retry_result = run(
-        ["terragrunt", "apply", "--auto-approve", "--non-interactive"],
-        cwd=module_dir,
-        check=False,
-        env=NON_INTERACTIVE_ENV,
-    )
-    _print_result_output(retry_result)
-    if retry_result.returncode != 0:
-        combined_retry = f"{retry_result.stdout}\n{retry_result.stderr}"
-        raise CommandError(f"Failed to deploy {module_name} after init retry.\n{combined_retry}")
-    ok(f"{module_name} deployed.")
-
-
-def _terragrunt_apply_with_env(module_path: str, module_name: str, extra_env: dict[str, str]) -> None:
-    module_dir = _module_dir(module_path)
-    if not module_dir.is_dir():
-        raise RuntimeError(f"Module directory not found: {module_dir}")
-
-    info(f"Deploying {module_name}...")
-    env = {**NON_INTERACTIVE_ENV, **extra_env}
+    env = {**NON_INTERACTIVE_ENV, **(extra_env or {})}
     apply_result = run(
         ["terragrunt", "apply", "--auto-approve", "--non-interactive"],
         cwd=module_dir,
@@ -547,6 +541,37 @@ def _terragrunt_apply_with_env(module_path: str, module_name: str, extra_env: di
         combined_retry = f"{retry_result.stdout}\n{retry_result.stderr}"
         raise CommandError(f"Failed to deploy {module_name} after init retry.\n{combined_retry}")
     ok(f"{module_name} deployed.")
+
+
+def _run_stage(
+    modules: list[tuple[str, str]],
+    apply_fn: Callable[[str, str], None],
+    *,
+    parallel: bool = False,
+) -> None:
+    """Execute modules in a stage. Sequential by default; parallel if enabled."""
+    if not parallel or len(modules) <= 1:
+        for module_path, module_name in modules:
+            apply_fn(module_path, module_name)
+        return
+
+    errors: list[tuple[str, Exception]] = []
+    with ThreadPoolExecutor(max_workers=len(modules)) as executor:
+        futures = {
+            executor.submit(apply_fn, module_path, module_name): module_name
+            for module_path, module_name in modules
+        }
+        for future in as_completed(futures):
+            module_name = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                errors.append((module_name, exc))
+
+    if errors:
+        for name, exc in errors:
+            warn(f"Stage failure: {name}: {exc}")
+        raise errors[0][1]
 
 
 def _apply_addon_module(module_path: str, module_name: str, ctx: Context) -> None:
@@ -633,10 +658,10 @@ def _ensure_shared_artifact_bucket(ctx: Context) -> None:
     if _bucket_exists(bucket):
         return
     for module_path, module_name in SHARED_DEPLOY_ORDER:
-        _terragrunt_apply_with_env(
+        _terragrunt_apply(
             module_path,
             module_name,
-            {"COLLIBRA_DQ_PACKAGE_LOCAL_PATH": ""},
+            extra_env={"COLLIBRA_DQ_PACKAGE_LOCAL_PATH": ""},
         )
     if not _wait_for_bucket(bucket, max_attempts=10, delay_seconds=2.0):
         raise RuntimeError(
@@ -883,7 +908,30 @@ def destroy_bootstrap(ctx: Context, *, interactive: bool = True) -> None:
         return
 
 
-def deploy(target: DeployTarget) -> None:
+def _deploy_addon_stages(ctx: Context, *, parallel: bool = False) -> None:
+    """Deploy addon modules using dependency-aware stages."""
+    for stage in ADDON_STAGES:
+        # Ensure install-script bucket is ready before the EC2 stage.
+        if any(mp == "addons/collibra-dq-standalone" for mp, _ in stage):
+            _ensure_install_script_bucket(ctx)
+        _run_stage(
+            stage,
+            lambda mp, mn: _apply_addon_module(mp, mn, ctx),
+            parallel=parallel,
+        )
+
+
+def _destroy_addon_stages(*, parallel: bool = False) -> None:
+    """Destroy addon modules in reverse stage order."""
+    for stage in reversed(ADDON_STAGES):
+        _run_stage(
+            list(reversed(stage)),
+            _terragrunt_destroy,
+            parallel=parallel,
+        )
+
+
+def deploy(target: DeployTarget, *, parallel: bool = False) -> None:
     ctx = _validate_deploy_target(target)
     info(
         f"Deploy target={target} env={ctx.environment} region={ctx.region} account={ctx.aws_account_id}"
@@ -900,10 +948,7 @@ def deploy(target: DeployTarget) -> None:
         _ensure_package_artifact_available(ctx)
         _ensure_install_script_bucket(ctx)
         _ensure_ami_id_for_addons(ctx)
-        for module_path, module_name in ADDON_DEPLOY_ORDER:
-            if module_path == "addons/collibra-dq-standalone":
-                _ensure_install_script_bucket(ctx)
-            _apply_addon_module(module_path, module_name, ctx)
+        _deploy_addon_stages(ctx, parallel=parallel)
         ok("Deploy completed.")
         return
 
@@ -921,15 +966,17 @@ def deploy(target: DeployTarget) -> None:
         _ensure_package_artifact_available(ctx)
         _ensure_install_script_bucket(ctx)
         _ensure_ami_id_for_addons(ctx)
-        for module_path, module_name in ADDON_DEPLOY_ORDER:
-            if module_path == "addons/collibra-dq-standalone":
-                _ensure_install_script_bucket(ctx)
-            _apply_addon_module(module_path, module_name, ctx)
+        _deploy_addon_stages(ctx, parallel=parallel)
 
     ok("Deploy completed.")
 
 
-def destroy(target: DestroyTarget, *, auto_approve: bool = False) -> None:
+def destroy(
+    target: DestroyTarget,
+    *,
+    auto_approve: bool = False,
+    parallel: bool = False,
+) -> None:
     ctx = _validate_destroy_target(target)
     info(
         f"Destroy target={target} env={ctx.environment} region={ctx.region} account={ctx.aws_account_id}"
@@ -948,13 +995,11 @@ def destroy(target: DestroyTarget, *, auto_approve: bool = False) -> None:
         return
 
     if target == "addon":
-        for module_path, module_name in reversed(ADDON_DEPLOY_ORDER):
-            _terragrunt_destroy(module_path, module_name)
+        _destroy_addon_stages(parallel=parallel)
         ok("Destroy completed.")
         return
 
-    for module_path, module_name in reversed(ADDON_DEPLOY_ORDER):
-        _terragrunt_destroy(module_path, module_name)
+    _destroy_addon_stages(parallel=parallel)
     for module_path, module_name in reversed(INFRA_DEPLOY_ORDER):
         _terragrunt_destroy(module_path, module_name)
     if target == "all":

@@ -42,7 +42,7 @@ Defines stack-wide behavior:
 - shared tags
 - dynamic defaults by environment (`dev`/`prod`)
 - reusable client-level overrides via `TG_*`
-- cost defaults (`dev`: 2 AZ footprint + single-AZ RDS)
+- cost defaults (`dev`: 2 AZ footprint + single-AZ RDS + public subnet EC2 to skip NAT/VPC endpoints)
 
 ### `collibra-dq/bootstrap`
 

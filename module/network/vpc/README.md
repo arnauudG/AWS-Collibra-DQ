@@ -1,15 +1,3 @@
----
-tags: []
-
-category: Documentation
-type: data/readme
-complexity: intermediate
-time_required: 15-30 minutes
-created: 2026-02-18
-status: active
-last_updated: 2026-02-18
----
-
 # VPC Network Module
 
 Creates an AWS VPC with public and private subnets across multiple availability zones.

@@ -1,15 +1,3 @@
----
-tags: []
-
-category: Documentation
-type: data/readme
-complexity: intermediate
-time_required: 15-30 minutes
-created: 2026-02-18
-status: active
-last_updated: 2026-04-01
----
-
 # S3 Package Storage Module
 
 Creates an S3 bucket and uploads package files for EC2 instance consumption.

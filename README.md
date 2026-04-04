@@ -107,7 +107,7 @@ Teams need a repeatable way to deploy Collibra DQ in AWS for development and con
          |                                                      |
          |   +-------------------- VPC ----------------------+  |
          |   |                                               |  |
-         |   |  Private Subnet(s)                            |  |
+         |   |  Public or Private Subnet (dev: public default) |  |
          |   |  +---------------------+                      |  |
          |   |  | EC2 Collibra DQ     |<-- S3 package ------+--+-- S3
          |   |  | (port 9000)         |                      |  |
@@ -118,7 +118,7 @@ Teams need a repeatable way to deploy Collibra DQ in AWS for development and con
          |   |      | RDS Postgres|                          |  |
          |   |      +-------------+                          |  |
          |   |                                               |  |
-         |   |  VPC Endpoints (SSM, S3)                      |  |
+         |   |  VPC Endpoints (S3 always; SSM if private)    |  |
          |   +-----------------------------------------------+  |
          |                                                      |
          +------------------------------------------------------+
@@ -132,6 +132,7 @@ AWS Classic Collibra Data Quality/
 ├── uv.lock                           # lockfile
 ├── .pre-commit-config.yaml           # checks and formatting
 ├── README.md                         # this guide
+├── env.example                       # environment variable reference template
 ├── CONTRIBUTING.md                   # contribution/release checklist
 │
 ├── src/collibra_dq_starter/
@@ -148,7 +149,12 @@ AWS Classic Collibra Data Quality/
 │   └── addons/                       # package + ec2 + alb + rotation restart
 │
 ├── module/                           # reusable Terraform modules
-│   └── operations/secret-rotation-restart/  # event-driven restart + alarms
+│   ├── application/collibra-dq-standalone/  # EC2 standalone install
+│   ├── database/rds/postgresql/             # RDS PostgreSQL
+│   ├── network/                             # vpc, vpc-endpoints, alb, target-group-attachment
+│   ├── operations/secret-rotation-restart/  # event-driven restart + alarms
+│   ├── security/security-group/             # ops (EC2) + rds SG modules
+│   └── storage/s3-package/                  # S3 bucket for artifacts
 └── packages/collibra-dq/             # local Collibra installer artifact
 ```
 
@@ -178,14 +184,14 @@ Credentials should allow creation/update of:
 
 ## Environment Variables
 
-All runtime configuration is environment-driven.
+All runtime configuration is environment-driven. See [`env.example`](env.example) for a complete annotated reference of all variables with defaults and descriptions.
 
 ### Required (for deploy/destroy lifecycle)
 
 | Variable | Description |
 |----------|-------------|
 | `TF_VAR_environment` | target environment (`dev` or `prod`) |
-| `TF_VAR_region` | target region (`eu-west-1`, `us-east-1`, `eu-central-1`) |
+| `TF_VAR_region` | target AWS region (any valid region, e.g. `eu-west-1`, `us-east-1`, `ap-southeast-2`) |
 | `AWS_PROFILE` or `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | AWS authentication |
 
 ### Required for `deploy --target addon` / `deploy --target full`
@@ -199,7 +205,7 @@ All runtime configuration is environment-driven.
 | Variable | Description |
 |----------|-------------|
 | `COLLIBRA_DQ_PACKAGE_URL` | Optional override package artifact URL (`s3://...` or `https://...`). If unset, orchestrator resolves shared artifact S3 URL automatically. |
-| `COLLIBRA_DQ_ADMIN_PASSWORD` | Password for the built-in Collibra DQ UI admin account `admin` (case-sensitive). For bootstrap compatibility it must be 8-72 chars, use only letters/digits/underscore, include upper/lower/digit/underscore, and must not contain `admin`; if unset/invalid, installer auto-generates a compliant password for non-interactive setup. |
+| `COLLIBRA_DQ_ADMIN_PASSWORD` | Password for the built-in Collibra DQ UI admin account `admin` (case-sensitive). Must be 8-72 chars with at least one uppercase, one digit, one special char (`!,%,&,@,#,$,^,?,_,~`), and must not contain `admin`. If unset or invalid, a compliant password is auto-generated. |
 | `COLLIBRA_DQ_AMI_ID` | Override EC2 AMI ID directly. If unset, CLI auto-resolves latest RHEL 7.9 AMI per region. |
 | `COLLIBRA_DQ_ENABLE_STANDALONE_HOOK` | Enables direct-standalone after-hook to auto-reconcile ALB target attachment (`false` by default; not needed for orchestrated full deploy). |
 | `COLLIBRA_DQ_ENABLE_ROTATION_RESTART` | Enable EventBridge->SSM restart on RDS secret rotation (`true` by default) |
@@ -249,6 +255,7 @@ These drive reusable naming and defaults in `env/stack/collibra-dq/root.hcl`.
 | `TG_RDS_BACKUP_RETENTION` | env-based default | backup days |
 | `TG_COLLIBRA_DQ_INSTANCE_TYPE` | env-based default | EC2 instance type |
 | `TG_COLLIBRA_DQ_VOLUME_SIZE` | env-based default | EC2 root volume size |
+| `TG_COLLIBRA_DQ_PUBLIC_SUBNET` | `true` in dev, always `false` in prod | Place EC2 in public subnet (saves ~$55/mo by skipping NAT Gateway + VPC interface endpoints) |
 | `TG_ALB_DELETION_PROTECTION` | env-based default | ALB deletion guard |
 
 ## Quick Start
@@ -261,15 +268,24 @@ cd "AWS Classic Collibra Data Quality"
 # 2) Install/sync python package
 uv sync
 
-# 3) Export required values
+# 3) Configure environment variables (use env.example as a reference)
+cp env.example .env.dev
+# Edit .env.dev with your values, then source it:
+source .env.dev
+
+# Or export manually:
 export TF_VAR_environment=dev
 export TF_VAR_region=eu-west-1
 export AWS_PROFILE=my-profile
 # Optional: if omitted, installer auto-generates a policy-compliant password.
 export COLLIBRA_DQ_ADMIN_PASSWORD='<password>'
 export COLLIBRA_DQ_LICENSE_KEY='<license-key>'
+
 # 4) Deploy full stack (package auto-uploads from packages/collibra-dq/ if not in S3)
 uv run --no-editable python -m collibra_dq_starter.cli deploy --target full
+
+# 5) Optional: use --parallel to run independent modules concurrently within each stage
+uv run --no-editable python -m collibra_dq_starter.cli deploy --target full --parallel
 ```
 
 ## Usage
@@ -282,6 +298,9 @@ uv run --no-editable python -m collibra_dq_starter.cli --help
 
 # Deploy full stack: bootstrap + infra + addons
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target full
+
+# Deploy with parallel stage execution (independent modules run concurrently)
+uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target full --parallel
 
 # Deploy bootstrap + infrastructure only
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target stack
@@ -309,6 +328,9 @@ uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-wes
 
 # Non-interactive destroy (CI/automation)
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 destroy --target all --yes
+
+# Destroy with parallel stage execution
+uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 destroy --target all --yes --parallel
 ```
 
 ### Target Matrix
@@ -610,6 +632,12 @@ python -m pytest
 
 Current enforced local coverage gate: `75%`
 
+GitHub validation is defined in [`/.github/workflows/validate.yml`](.github/workflows/validate.yml) and runs:
+
+- `terragrunt hcl validate --working-dir env --non-interactive --no-color`
+- `terraform fmt -check -recursive env module`
+- `uv run --no-editable python -m pytest`
+
 AWS smoke tests remain opt-in and are documented in [docs/testing-strategy.md](docs/testing-strategy.md).
 
 ## Troubleshooting
@@ -701,7 +729,7 @@ Most common cause in this stack: opening HTTPS on an HTTP-only listener.
 1. Terraform state can contain sensitive data; protect backend access.
 2. Never commit secrets into repo files.
 3. Keep Collibra secrets in CI/CD secret stores or secure shell/session vars.
-4. Prefer private subnet + SSM access model for app hosts.
+4. Prod uses private subnet + SSM access model for app hosts (defense-in-depth). Dev defaults to public subnet for cost savings; SG rules still restrict access to ALB-only. Override with `TG_COLLIBRA_DQ_PUBLIC_SUBNET=false` to force private subnet in dev.
 5. Enable stricter prod settings (`TG_RDS_DELETION_PROTECTION`, `TG_RDS_MULTI_AZ`, TLS/certs where applicable).
 
 ## Contributing

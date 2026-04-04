@@ -174,7 +174,7 @@ variable "spark_package" {
 }
 
 variable "dq_admin_user_password" {
-  description = "Password for DQ Web admin user (case-sensitive). Bootstrap-safe values must use only letters, digits, and underscore, include upper/lower/digit/underscore, and must not contain 'admin'."
+  description = "Password for DQ Web admin user (case-sensitive). Must be 8-72 chars with at least one uppercase, one digit, one special char (!,%,&,@,#,$,^,?,_,~). Cannot contain 'admin'. If empty or invalid, a compliant password is auto-generated."
   type        = string
   sensitive   = true
   default     = ""

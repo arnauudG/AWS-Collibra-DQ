@@ -243,16 +243,19 @@ ADMIN_DEBUG_DIR="/etc/collibra-dq"
 ADMIN_DEBUG_FILE="$ADMIN_DEBUG_DIR/admin-bootstrap-debug.env"
 
 validate_admin_password_policy() {
+  # Collibra DQ password policy (from official docs):
+  # - 8-72 characters
+  # - At least one uppercase letter
+  # - At least one numeric character
+  # - At least one special character (supported: !,%,&,@,#,$,^,,?,_,~)
+  # - Cannot contain the PostgreSQL username (admin)
   local password="$1"
   [ -n "$password" ] || return 1
   [ $${#password} -ge 8 ] || return 1
   [ $${#password} -le 72 ] || return 1
-  echo "$password" | grep -q '^[A-Za-z0-9_]*$' || return 1
   echo "$password" | grep -q '[A-Z]' || return 1
-  echo "$password" | grep -q '[a-z]' || return 1
   echo "$password" | grep -q '[0-9]' || return 1
-  echo "$password" | grep -q '_' || return 1
-  # Collibra setup rejects passwords that include the default admin user id.
+  echo "$password" | grep -q '[!%&@#$^?_~]' || return 1
   if echo "$password" | tr '[:upper:]' '[:lower:]' | grep -q "admin"; then
     return 1
   fi
@@ -261,10 +264,13 @@ validate_admin_password_policy() {
 
 generate_compliant_admin_password() {
   local candidate=""
-  local alphabet='A-Za-z0-9_'
+  local alphabet='A-Za-z0-9'
+  local specials='!%&@#$^?_~'
   while true; do
     candidate="$(LC_ALL=C tr -dc "$alphabet" </dev/urandom | head -c 24 || true)"
-    candidate="Aa9_$candidate"
+    # Prepend guaranteed uppercase + lowercase + digit + special
+    local special_char="$${specials:$$((RANDOM % $${#specials})):1}"
+    candidate="Aa9$${special_char}$candidate"
     candidate="$${candidate:0:32}"
     if validate_admin_password_policy "$candidate"; then
       printf '%s' "$candidate"
@@ -326,7 +332,7 @@ if [ -z "$DQ_ADMIN_USER_PASSWORD" ]; then
   DQ_ADMIN_PASSWORD_SOURCE="generated-empty"
   echo "DQ_ADMIN_USER_PASSWORD was empty; generated a compliant password for non-interactive setup."
 elif ! validate_admin_password_policy "$DQ_ADMIN_USER_PASSWORD"; then
-  echo "WARNING: Provided DQ_ADMIN_USER_PASSWORD does not match the bootstrap-safe Collibra policy (8-72 chars, only letters/digits/underscore, must include upper/lower/digit/underscore, and must not contain 'admin')."
+  echo "WARNING: Provided DQ_ADMIN_USER_PASSWORD does not match the Collibra DQ password policy (8-72 chars, at least one uppercase, one digit, one special char from !%&@#\$^?_~, and must not contain 'admin')."
   DQ_ADMIN_USER_PASSWORD="$(generate_compliant_admin_password)"
   DQ_ADMIN_PASSWORD_SOURCE="generated-invalid"
   echo "Generated a compliant DQ_ADMIN_USER_PASSWORD for this install run."
@@ -507,6 +513,39 @@ if [ -d "$OWL_BASE/owl" ];then
   echo "Package extracted to owl/ subdirectory, using $ACTUAL_OWL_BASE as base"
 fi
 
+ensure_bundled_postgresql_client() {
+  local bundled_dir="$OWL_BASE/packages/install-packages"
+  local pg_rpm=""
+  local pg_libs_rpm=""
+
+  pg_rpm=$(find "$bundled_dir" -maxdepth 1 -type f -name 'postgresql12-[0-9]*.rpm' | head -1)
+  pg_libs_rpm=$(find "$bundled_dir" -maxdepth 1 -type f -name 'postgresql12-libs-[0-9]*.rpm' | head -1)
+
+  if [ -x /usr/pgsql-12/bin/psql ]; then
+    echo "Bundled PostgreSQL 12 client already available: $(/usr/pgsql-12/bin/psql --version)"
+    return 0
+  fi
+
+  if [ -n "$pg_rpm" ] && [ -n "$pg_libs_rpm" ]; then
+    echo "Installing bundled PostgreSQL 12 client for SCRAM-compatible metastore access..."
+    if [ "$PKG_MGR" = "yum" ]; then
+      yum -y localinstall "$pg_libs_rpm" "$pg_rpm" || true
+    elif [ "$PKG_MGR" = "dnf" ]; then
+      dnf -y install "$pg_libs_rpm" "$pg_rpm" || true
+    else
+      rpm -Uvh --replacepkgs "$pg_libs_rpm" "$pg_rpm" || true
+    fi
+  fi
+
+  if [ -x /usr/pgsql-12/bin/psql ]; then
+    echo "Bundled PostgreSQL client installed successfully: $(/usr/pgsql-12/bin/psql --version)"
+  else
+    echo "WARNING: bundled PostgreSQL 12 client installation failed; DB reconciliation may be unavailable."
+  fi
+}
+
+ensure_bundled_postgresql_client
+
 shell_quote_single() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
@@ -662,6 +701,72 @@ if [ -n "$OWL_ENV_SCRIPT" ]&&[ -f "$OWL_ENV_SCRIPT" ];then
   _owl_env_set OWL_WEB_HTTP_ADDRESS "0.0.0.0"
   grep -q "http\.address" "$OWL_ENV_SCRIPT"||echo 'export OWL_WEB_OPTS="$${OWL_WEB_OPTS:-} -Dhttp.address=0.0.0.0"' >> "$OWL_ENV_SCRIPT"
 fi
+
+generate_bcrypt_hash() {
+  local raw_password="$1"
+  if ! command -v htpasswd >/dev/null 2>&1; then
+    pkg_install httpd-tools >/dev/null 2>&1 || true
+  fi
+  if command -v htpasswd >/dev/null 2>&1; then
+    htpasswd -bnBC 10 '' "$raw_password" | tr -d ':\n'
+    return 0
+  fi
+  return 1
+}
+
+reconcile_admin_password() {
+  local psql_bin=""
+  local admin_hash=""
+  local sql_hash=""
+  local attempts=12
+  local attempt=1
+  local user_count=""
+
+  if [ -x /usr/pgsql-12/bin/psql ]; then
+    psql_bin="/usr/pgsql-12/bin/psql"
+  elif command -v psql >/dev/null 2>&1; then
+    psql_bin="$(command -v psql)"
+  else
+    echo "WARNING: psql is unavailable; skipping admin password reconciliation."
+    return 0
+  fi
+
+  if ! admin_hash=$(generate_bcrypt_hash "$BOOTSTRAP_DQ_ADMIN_USER_PASSWORD"); then
+    echo "WARNING: could not generate bcrypt hash for admin reconciliation; skipping."
+    return 0
+  fi
+
+  sql_hash=$(printf "%s" "$admin_hash" | sed "s/'/''/g")
+  export PGPASSWORD="$OWL_METASTORE_PASS"
+
+  while [ "$attempt" -le "$attempts" ]; do
+    user_count=$("$psql_bin" \
+      -h "$POSTGRESQL_HOST" \
+      -p "$POSTGRESQL_PORT" \
+      -U "$OWL_METASTORE_USER" \
+      -d "$POSTGRESQL_DATABASE" \
+      -tAc "select count(*) from users where username = 'admin';" 2>/dev/null | tr -d '[:space:]') || user_count=""
+
+    if [ "$user_count" = "1" ]; then
+      "$psql_bin" \
+        -h "$POSTGRESQL_HOST" \
+        -p "$POSTGRESQL_PORT" \
+        -U "$OWL_METASTORE_USER" \
+        -d "$POSTGRESQL_DATABASE" \
+        -c "update users set password = '$sql_hash', enabled = true, accountnonlocked = true, invalid_login_attempts = 0, password_reset_token = null, token_expiration = null where username = 'admin';" >/dev/null
+      echo "Admin password reconciled in metastore."
+      unset PGPASSWORD
+      return 0
+    fi
+
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+
+  unset PGPASSWORD
+  echo "WARNING: admin user was not present in the metastore during reconciliation window."
+  return 0
+}
 # Patch Play/Java config if present so web binds to 0.0.0.0
 for f in "$ACTUAL_OWL_BASE/config/application.conf" "$ACTUAL_OWL_BASE/conf/application.conf" "$ACTUAL_OWL_BASE/owlweb/conf/application.conf";do
   if [ -f "$f" ];then
@@ -870,25 +975,45 @@ if [ -n "$OWL_MANAGE_SCRIPT" ];then
       exit 1
     fi
   fi
-  if [ "$LICENSE_CONFIGURED" = true ]; then
-    set +e
-    "$OWL_MANAGE_SCRIPT" stop=owlweb || true
-    sleep 3
-    "$OWL_MANAGE_SCRIPT" start=owlweb
-    OWL_WEB_RESTART_EXIT=$?
-    record_exit_code "$OWL_WEB_RESTART_EXIT"
-    set -e
-    if [ "$OWL_WEB_RESTART_EXIT" -ne 0 ]; then
-      echo "WARNING: owlmanage.sh start=owlweb exited with code $OWL_WEB_RESTART_EXIT"
-      collect_startup_diagnostics
-      if wait_for_web_listener 120 5 || web_process_present; then
-        echo "owlweb restart returned non-zero, but DQ Web is listening on :9000. Continuing."
-        OWL_WEB_RESTART_EXIT=0
-        record_exit_code 0
-      else
-        echo "ERROR: owlmanage.sh start=owlweb failed and DQ Web did not listen on :9000."
-        exit 1
-      fi
+  # Restart owl-web so it seeds the admin user in the metastore DB,
+  # then reconcile the admin password, then restart again so the app
+  # picks up the updated password from the DB (it caches on startup).
+  set +e
+  "$OWL_MANAGE_SCRIPT" stop=owlweb || true
+  sleep 3
+  "$OWL_MANAGE_SCRIPT" start=owlweb
+  OWL_WEB_RESTART_EXIT=$?
+  record_exit_code "$OWL_WEB_RESTART_EXIT"
+  set -e
+  if [ "$OWL_WEB_RESTART_EXIT" -ne 0 ]; then
+    echo "WARNING: owlmanage.sh start=owlweb exited with code $OWL_WEB_RESTART_EXIT"
+    collect_startup_diagnostics
+    if wait_for_web_listener 120 5 || web_process_present; then
+      echo "owlweb restart returned non-zero, but DQ Web is listening on :9000. Continuing."
+      OWL_WEB_RESTART_EXIT=0
+      record_exit_code 0
+    else
+      echo "ERROR: owlmanage.sh start=owlweb failed and DQ Web did not listen on :9000."
+      exit 1
+    fi
+  fi
+  # Update admin password in DB after owl-web has created the admin user
+  reconcile_admin_password
+  # Restart owl-web again so it loads the reconciled password from DB
+  set +e
+  "$OWL_MANAGE_SCRIPT" stop=owlweb || true
+  sleep 3
+  "$OWL_MANAGE_SCRIPT" start=owlweb
+  OWL_WEB_FINAL_EXIT=$?
+  record_exit_code "$OWL_WEB_FINAL_EXIT"
+  set -e
+  if [ "$OWL_WEB_FINAL_EXIT" -ne 0 ]; then
+    echo "WARNING: final owlweb restart exited with code $OWL_WEB_FINAL_EXIT"
+    if wait_for_web_listener 120 5 || web_process_present; then
+      echo "Final owlweb restart returned non-zero, but DQ Web is listening on :9000. Continuing."
+    else
+      echo "ERROR: final owlweb restart failed and DQ Web did not listen on :9000."
+      exit 1
     fi
   fi
   sleep 5

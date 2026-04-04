@@ -1,0 +1,54 @@
+name: Validate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_environment: dev
+      TF_VAR_region: eu-west-1
+      TG_ACCOUNT_ID: "111111111111"
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_PAGER: ""
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.4"
+
+      - name: Install Terragrunt
+        env:
+          TERRAGRUNT_VERSION: "0.82.3"
+        run: |
+          curl -fsSL -o /tmp/terragrunt "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64"
+          chmod +x /tmp/terragrunt
+          sudo mv /tmp/terragrunt /usr/local/bin/terragrunt
+
+      - name: Install project dependencies
+        run: uv sync --dev
+
+      - name: Validate Terragrunt HCL
+        run: terragrunt hcl validate --working-dir env --non-interactive --no-color
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive env module
+
+      - name: Run test suite
+        run: uv run --no-editable python -m pytest

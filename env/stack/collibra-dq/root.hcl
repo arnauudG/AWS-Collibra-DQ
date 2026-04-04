@@ -37,8 +37,11 @@ locals {
   }
 
   collibra_dq_config = {
-    instance_type = get_env("TG_COLLIBRA_DQ_INSTANCE_TYPE", local.env == "prod" ? "m5.xlarge" : "m5.large")
-    volume_size   = tonumber(get_env("TG_COLLIBRA_DQ_VOLUME_SIZE", local.env == "prod" ? "200" : "100"))
+    instance_type     = get_env("TG_COLLIBRA_DQ_INSTANCE_TYPE", local.env == "prod" ? "m5.xlarge" : "m5.large")
+    volume_size       = tonumber(get_env("TG_COLLIBRA_DQ_VOLUME_SIZE", local.env == "prod" ? "200" : "100"))
+    # Dev cost optimization: place EC2 in public subnet to avoid NAT Gateway + VPC endpoint costs (~$55/mo).
+    # Prod always uses private subnet for defense-in-depth.
+    use_public_subnet = local.env == "prod" ? false : lower(get_env("TG_COLLIBRA_DQ_PUBLIC_SUBNET", "true")) == "true"
   }
 
   alb_config = {

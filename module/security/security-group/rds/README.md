@@ -1,15 +1,3 @@
----
-tags: []
-
-category: Documentation
-type: data/readme
-complexity: intermediate
-time_required: 15-30 minutes
-created: 2026-02-18
-status: active
-last_updated: 2026-02-18
----
-
 # Security Group - RDS Module
 
 Creates a security group specifically designed for RDS PostgreSQL instances.

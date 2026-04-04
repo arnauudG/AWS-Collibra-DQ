@@ -15,7 +15,8 @@ locals {
   env         = include.root.locals.env
   aws_region  = include.root.locals.aws_region
   common_tags = include.root.locals.common_tags
-  vpc_config  = include.root.locals.vpc_config
+  vpc_config         = include.root.locals.vpc_config
+  collibra_dq_config = include.root.locals.collibra_dq_config
 
   prefix      = "${local.org}-${local.env}-${local.aws_region}-collibra-dq"
   az_count    = try(local.vpc_config.az_count, 3)
@@ -46,7 +47,9 @@ inputs = {
     cidrsubnet(try(local.vpc_config.collibra_dq_cidr, local.vpc_config.cidr), 6, idx + local.az_count)
   ]
 
-  enable_nat_gateway   = true
+  # NAT Gateway is only needed when EC2 runs in a private subnet.
+  # Dev default (public subnet) skips NAT to save ~$33/mo.
+  enable_nat_gateway   = !local.collibra_dq_config.use_public_subnet
   single_nat_gateway   = local.vpc_config.single_nat_gateway
   enable_dns_hostnames = true
   enable_dns_support   = true

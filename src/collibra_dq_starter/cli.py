@@ -33,6 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="full",
         help="bootstrap=backend only, stack=backend+infra, addon=backend+addons, package=backend+artifact only, full=backend+infra+addons",
     )
+    deploy_parser.add_argument(
+        "--parallel",
+        action="store_true",
+        default=False,
+        help="Run independent modules within each stage in parallel.",
+    )
 
     destroy_parser = subparsers.add_parser("destroy", help="Destroy resources.")
     destroy_parser.add_argument(
@@ -45,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Skip interactive confirmations (use with caution).",
+    )
+    destroy_parser.add_argument(
+        "--parallel",
+        action="store_true",
+        default=False,
+        help="Run independent modules within each stage in parallel.",
     )
     return parser
 
@@ -60,9 +72,13 @@ def main() -> int:
 
     try:
         if args.command == "deploy":
-            deploy(args.target)
+            deploy(args.target, parallel=getattr(args, "parallel", False))
         elif args.command == "destroy":
-            destroy(args.target, auto_approve=getattr(args, "yes", False))
+            destroy(
+                args.target,
+                auto_approve=getattr(args, "yes", False),
+                parallel=getattr(args, "parallel", False),
+            )
         else:
             parser.error(f"Unknown command: {args.command}")
             return 2

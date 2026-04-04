@@ -70,6 +70,31 @@ def test_require_core_env_rejects_invalid_region(monkeypatch):
         orchestrator._require_core_env()
 
 
+@pytest.mark.parametrize(
+    "region",
+    ["ap-southeast-2", "us-gov-west-1", "me-south-1", "af-south-1", "sa-east-1"],
+)
+def test_require_core_env_accepts_valid_aws_regions(monkeypatch, region):
+    monkeypatch.setenv("TF_VAR_environment", "dev")
+    monkeypatch.setenv("TF_VAR_region", region)
+    monkeypatch.setenv("TG_ORG", "dq")
+
+    _, reg, _ = orchestrator._require_core_env()
+    assert reg == region
+
+
+@pytest.mark.parametrize(
+    "region",
+    ["moon-1", "123-abc-1", "eu_west_1", "EU-WEST-1", "eu-west-"],
+)
+def test_require_core_env_rejects_malformed_regions(monkeypatch, region):
+    monkeypatch.setenv("TF_VAR_environment", "dev")
+    monkeypatch.setenv("TF_VAR_region", region)
+
+    with pytest.raises(RuntimeError, match="Invalid TF_VAR_region"):
+        orchestrator._require_core_env()
+
+
 def test_validate_uuid_env_rejects_invalid(monkeypatch):
     monkeypatch.setenv("COLLIBRA_DQ_INSTALLATION_ID", "not-a-uuid")
 
@@ -210,7 +235,7 @@ def test_terragrunt_apply_retries_after_provider_init_failure(monkeypatch, tmp_p
     assert seen[2][:2] == ("terragrunt", "apply")
 
 
-def test_terragrunt_apply_with_env_retries_and_merges_extra_env(monkeypatch, tmp_path):
+def test_terragrunt_apply_with_extra_env_retries_and_merges(monkeypatch, tmp_path):
     module_dir = tmp_path / "module"
     module_dir.mkdir()
     monkeypatch.setattr(orchestrator, "_module_dir", lambda _module_path: module_dir)
@@ -231,7 +256,7 @@ def test_terragrunt_apply_with_env_retries_and_merges_extra_env(monkeypatch, tmp
 
     monkeypatch.setattr(orchestrator, "run", fake_run)
 
-    orchestrator._terragrunt_apply_with_env("x", "Module", {"EXTRA_FLAG": "1"})
+    orchestrator._terragrunt_apply("x", "Module", extra_env={"EXTRA_FLAG": "1"})
     assert envs[0]["EXTRA_FLAG"] == "1"
     assert envs[0]["TF_INPUT"] == "0"
 
@@ -261,11 +286,11 @@ def test_ensure_shared_artifact_bucket_applies_when_missing(monkeypatch):
     monkeypatch.setattr(orchestrator, "_bucket_exists", lambda _bucket: False)
     monkeypatch.setattr(orchestrator, "_wait_for_bucket", lambda _bucket, **_kwargs: True)
 
-    applied: list[tuple[str, dict[str, str]]] = []
+    applied: list[tuple[str, dict[str, str] | None]] = []
     monkeypatch.setattr(
         orchestrator,
-        "_terragrunt_apply_with_env",
-        lambda module_path, _name, extra_env: applied.append((module_path, extra_env)),
+        "_terragrunt_apply",
+        lambda module_path, _name, extra_env=None: applied.append((module_path, extra_env)),
     )
 
     orchestrator._ensure_shared_artifact_bucket(ctx)
@@ -277,7 +302,7 @@ def test_ensure_shared_artifact_bucket_raises_when_bucket_never_appears(monkeypa
     monkeypatch.setattr(orchestrator, "_artifact_bucket_name", lambda _ctx: "shared-bucket")
     monkeypatch.setattr(orchestrator, "_bucket_exists", lambda _bucket: False)
     monkeypatch.setattr(orchestrator, "_wait_for_bucket", lambda _bucket, **_kwargs: False)
-    monkeypatch.setattr(orchestrator, "_terragrunt_apply_with_env", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator, "_terragrunt_apply", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="Shared artifact bucket not found after deploy"):
         orchestrator._ensure_shared_artifact_bucket(ctx)
@@ -491,7 +516,8 @@ def test_deploy_full_executes_expected_order(monkeypatch):
     infra_calls: list[str] = []
     addon_calls: list[str] = []
     monkeypatch.setattr(
-        orchestrator, "_terragrunt_apply", lambda module_path, _name: infra_calls.append(module_path)
+        orchestrator, "_terragrunt_apply",
+        lambda module_path, _name, extra_env=None: infra_calls.append(module_path),
     )
     monkeypatch.setattr(
         orchestrator,
@@ -549,7 +575,7 @@ def test_deploy_package_only_runs_package_order(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "_terragrunt_apply",
-        lambda module_path, _name: applied.append(module_path),
+        lambda module_path, _name, extra_env=None: applied.append(module_path),
     )
 
     orchestrator.deploy("package")
@@ -619,3 +645,107 @@ def test_destroy_all_executes_expected_reverse_order(monkeypatch):
         *(path for path, _ in reversed(orchestrator.SHARED_DEPLOY_ORDER)),
     ]
     assert destroyed == expected
+
+
+# ---------------------------------------------------------------------------
+# Stage-based parallel execution tests
+# ---------------------------------------------------------------------------
+
+
+def test_addon_stages_flatten_to_addon_deploy_order():
+    flat = [m for stage in orchestrator.ADDON_STAGES for m in stage]
+    assert flat == orchestrator.ADDON_DEPLOY_ORDER
+
+
+def test_run_stage_sequential_executes_in_order():
+    modules = [("a", "Module A"), ("b", "Module B"), ("c", "Module C")]
+    calls: list[str] = []
+    orchestrator._run_stage(modules, lambda mp, _mn: calls.append(mp), parallel=False)
+    assert calls == ["a", "b", "c"]
+
+
+def test_run_stage_parallel_runs_all_modules():
+    modules = [("a", "Module A"), ("b", "Module B")]
+    calls: list[str] = []
+
+    def fake_apply(mp, _mn):
+        calls.append(mp)
+
+    orchestrator._run_stage(modules, fake_apply, parallel=True)
+    assert sorted(calls) == ["a", "b"]
+
+
+def test_run_stage_parallel_collects_errors():
+    modules = [("a", "Module A"), ("b", "Module B")]
+
+    def failing_apply(mp, _mn):
+        if mp == "b":
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        orchestrator._run_stage(modules, failing_apply, parallel=True)
+
+
+def test_run_stage_single_module_skips_threadpool():
+    """A stage with 1 module runs sequentially even when parallel=True."""
+    modules = [("a", "Module A")]
+    calls: list[str] = []
+    orchestrator._run_stage(modules, lambda mp, _mn: calls.append(mp), parallel=True)
+    assert calls == ["a"]
+
+
+def test_deploy_full_parallel_flag_propagates(monkeypatch):
+    ctx = _ctx()
+    monkeypatch.setattr(orchestrator, "_validate_deploy_target", lambda _target: ctx)
+    monkeypatch.setattr(orchestrator, "deploy_bootstrap", lambda _ctx: None)
+    monkeypatch.setattr(orchestrator, "_ensure_shared_artifact_bucket", lambda _ctx: None)
+    monkeypatch.setattr(orchestrator, "_ensure_package_artifact_available", lambda _ctx: None)
+    monkeypatch.setattr(orchestrator, "_ensure_install_script_bucket", lambda _ctx: None)
+    monkeypatch.setattr(orchestrator, "_ensure_ami_id_for_addons", lambda _ctx: None)
+    monkeypatch.setattr(orchestrator, "ok", lambda _msg: None)
+    monkeypatch.setattr(orchestrator, "info", lambda _msg: None)
+    monkeypatch.setattr(
+        orchestrator, "_terragrunt_apply",
+        lambda module_path, _name, extra_env=None: None,
+    )
+
+    parallel_values: list[bool] = []
+    original = orchestrator._deploy_addon_stages
+
+    def capture_parallel(ctx, *, parallel=False):
+        parallel_values.append(parallel)
+        monkeypatch.setattr(
+            orchestrator, "_apply_addon_module",
+            lambda module_path, _name, _ctx: None,
+        )
+        return original(ctx, parallel=False)
+
+    monkeypatch.setattr(orchestrator, "_deploy_addon_stages", capture_parallel)
+
+    orchestrator.deploy("full", parallel=True)
+    assert parallel_values == [True]
+
+
+def test_deploy_addon_stages_calls_apply_addon_module(monkeypatch):
+    ctx = _ctx()
+    monkeypatch.setattr(orchestrator, "_ensure_install_script_bucket", lambda _ctx: None)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        orchestrator, "_apply_addon_module",
+        lambda mp, _mn, _ctx: calls.append(mp),
+    )
+
+    orchestrator._deploy_addon_stages(ctx, parallel=False)
+    assert calls == [path for path, _ in orchestrator.ADDON_DEPLOY_ORDER]
+
+
+def test_destroy_addon_stages_calls_terragrunt_destroy(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        orchestrator, "_terragrunt_destroy",
+        lambda mp, _mn: calls.append(mp),
+    )
+
+    orchestrator._destroy_addon_stages(parallel=False)
+    assert calls == [path for path, _ in reversed(orchestrator.ADDON_DEPLOY_ORDER)]

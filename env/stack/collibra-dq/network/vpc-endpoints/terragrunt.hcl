@@ -11,10 +11,15 @@ include "common" {
 }
 
 locals {
-  org         = include.root.locals.org
-  env         = include.root.locals.env
-  aws_region  = include.root.locals.aws_region
-  common_tags = include.root.locals.common_tags
+  org                = include.root.locals.org
+  env                = include.root.locals.env
+  aws_region         = include.root.locals.aws_region
+  common_tags        = include.root.locals.common_tags
+  collibra_dq_config = include.root.locals.collibra_dq_config
+
+  # Interface endpoints (SSM trio) are only needed when EC2 is in a private subnet.
+  # In public subnet mode, SSM agent reaches AWS APIs over the internet — saves ~$22/mo.
+  needs_interface_endpoints = !local.collibra_dq_config.use_public_subnet
 }
 
 dependency "vpc" {
@@ -23,10 +28,10 @@ dependency "vpc" {
   mock_outputs = {
     vpc_id                  = "vpc-123456"
     vpc_cidr_block          = "10.10.0.0/16"
-    private_subnets         = ["subnet-a", "subnet-b", "subnet-c"]
-    private_route_table_ids = ["rtb-a", "rtb-b", "rtb-c"]
+    private_subnets         = ["subnet-a", "subnet-b"]
+    private_route_table_ids = ["rtb-a"]
+    public_route_table_ids  = ["rtb-pub-a"]
   }
-  # Allow mocks for destroy because VPC might be destroyed before VPC endpoints
   mock_outputs_allowed_terraform_commands = ["init", "plan", "validate", "destroy"]
 }
 
@@ -41,11 +46,11 @@ terraform {
 inputs = {
   vpc_id = dependency.vpc.outputs.vpc_id
 
-  # Shared SG for Interface endpoints
-  create_security_group      = true
+  # SG for interface endpoints (only created when interface endpoints are deployed)
+  create_security_group      = local.needs_interface_endpoints
   security_group_name        = "${local.org}-${local.env}-collibra-dq-vpce-sg"
   security_group_description = "Allow HTTPS from VPC to VPC Endpoints (Collibra DQ stack)"
-  security_group_rules = [
+  security_group_rules = local.needs_interface_endpoints ? [
     {
       type        = "ingress"
       from_port   = 443
@@ -62,7 +67,7 @@ inputs = {
       description = "Allow all egress"
       cidr_blocks = ["0.0.0.0/0"]
     }
-  ]
+  ] : []
 
   security_group_tags = merge(local.common_tags, {
     Component = "network"
@@ -70,55 +75,61 @@ inputs = {
     Name      = "${local.org}-${local.env}-collibra-dq-vpce-sg"
   })
 
-  # Interface endpoints
-  endpoints = {
-    # SSM trio (Session Manager)
-    ssm = {
-      service             = "ssm"
-      service_type        = "Interface"
-      private_dns_enabled = true
-      subnet_ids          = dependency.vpc.outputs.private_subnets
-      tags = merge(local.common_tags, {
-        Component = "network"
-        Stack     = "collibra-dq"
-        Name      = "${local.org}-${local.env}-collibra-dq-vpce-ssm"
-      })
+  endpoints = merge(
+    # Interface endpoints (SSM trio) — only for private subnet mode
+    local.needs_interface_endpoints ? {
+      ssm = {
+        service             = "ssm"
+        service_type        = "Interface"
+        private_dns_enabled = true
+        subnet_ids          = dependency.vpc.outputs.private_subnets
+        tags = merge(local.common_tags, {
+          Component = "network"
+          Stack     = "collibra-dq"
+          Name      = "${local.org}-${local.env}-collibra-dq-vpce-ssm"
+        })
+      }
+      ssmmessages = {
+        service             = "ssmmessages"
+        service_type        = "Interface"
+        private_dns_enabled = true
+        subnet_ids          = dependency.vpc.outputs.private_subnets
+        tags = merge(local.common_tags, {
+          Component = "network"
+          Stack     = "collibra-dq"
+          Name      = "${local.org}-${local.env}-collibra-dq-vpce-ssmmessages"
+        })
+      }
+      ec2messages = {
+        service             = "ec2messages"
+        service_type        = "Interface"
+        private_dns_enabled = true
+        subnet_ids          = dependency.vpc.outputs.private_subnets
+        tags = merge(local.common_tags, {
+          Component = "network"
+          Stack     = "collibra-dq"
+          Name      = "${local.org}-${local.env}-collibra-dq-vpce-ec2messages"
+        })
+      }
+    } : {},
+    # S3 Gateway endpoint (free, always included)
+    # Attach to public + private route tables in public subnet mode
+    {
+      s3 = {
+        service         = "s3"
+        service_type    = "Gateway"
+        route_table_ids = local.collibra_dq_config.use_public_subnet ? concat(
+          dependency.vpc.outputs.public_route_table_ids,
+          dependency.vpc.outputs.private_route_table_ids
+        ) : dependency.vpc.outputs.private_route_table_ids
+        tags = merge(local.common_tags, {
+          Component = "network"
+          Stack     = "collibra-dq"
+          Name      = "${local.org}-${local.env}-collibra-dq-vpce-s3"
+        })
+      }
     }
-    ssmmessages = {
-      service             = "ssmmessages"
-      service_type        = "Interface"
-      private_dns_enabled = true
-      subnet_ids          = dependency.vpc.outputs.private_subnets
-      tags = merge(local.common_tags, {
-        Component = "network"
-        Stack     = "collibra-dq"
-        Name      = "${local.org}-${local.env}-collibra-dq-vpce-ssmmessages"
-      })
-    }
-    ec2messages = {
-      service             = "ec2messages"
-      service_type        = "Interface"
-      private_dns_enabled = true
-      subnet_ids          = dependency.vpc.outputs.private_subnets
-      tags = merge(local.common_tags, {
-        Component = "network"
-        Stack     = "collibra-dq"
-        Name      = "${local.org}-${local.env}-collibra-dq-vpce-ec2messages"
-      })
-    }
-
-    # S3 Gateway endpoint (for package downloads)
-    s3 = {
-      service         = "s3"
-      service_type    = "Gateway"
-      route_table_ids = dependency.vpc.outputs.private_route_table_ids
-      tags = merge(local.common_tags, {
-        Component = "network"
-        Stack     = "collibra-dq"
-        Name      = "${local.org}-${local.env}-collibra-dq-vpce-s3"
-      })
-    }
-  }
+  )
 
   tags = merge(local.common_tags, {
     Component = "network"

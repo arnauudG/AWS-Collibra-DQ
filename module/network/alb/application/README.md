@@ -1,15 +1,3 @@
----
-tags: []
-
-category: Documentation
-type: data/readme
-complexity: intermediate
-time_required: 15-30 minutes
-created: 2026-02-18
-status: active
-last_updated: 2026-02-18
----
-
 # Application Load Balancer Module
 
 Creates an AWS Application Load Balancer with configurable listeners and target groups.

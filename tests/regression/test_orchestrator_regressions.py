@@ -285,3 +285,31 @@ def test_installer_template_caches_bootstrap_admin_credentials_before_resourcing
     assert 'BOOTSTRAP_DQ_ADMIN_USER_EMAIL="$DQ_ADMIN_USER_EMAIL"' in template
     assert '_owl_env_set DQ_ADMIN_USER_PASSWORD "$BOOTSTRAP_DQ_ADMIN_USER_PASSWORD"' in template
     assert '_owl_env_set DQ_ADMIN_USER_EMAIL "$BOOTSTRAP_DQ_ADMIN_USER_EMAIL"' in template
+
+
+def test_installer_template_restarts_owlweb_after_rewriting_admin_env():
+    template_path = (
+        Path(__file__).resolve().parents[2]
+        / "module/application/collibra-dq-standalone/user-data/install_collibra_dq.sh.tmpl"
+    )
+    template = template_path.read_text(encoding="utf-8")
+
+    assert "Restart owl-web unconditionally" in template
+    assert '"$OWL_MANAGE_SCRIPT" stop=owlweb || true' in template
+    assert '"$OWL_MANAGE_SCRIPT" start=owlweb' in template
+    assert 'if [ "$LICENSE_CONFIGURED" = true ]; then' not in template
+
+
+def test_installer_template_reconciles_admin_password_in_metastore():
+    template_path = (
+        Path(__file__).resolve().parents[2]
+        / "module/application/collibra-dq-standalone/user-data/install_collibra_dq.sh.tmpl"
+    )
+    template = template_path.read_text(encoding="utf-8")
+
+    assert "Installing bundled PostgreSQL 12 client for SCRAM-compatible metastore access" in template
+    assert "ensure_bundled_postgresql_client()" in template
+    assert "generate_bcrypt_hash()" in template
+    assert "reconcile_admin_password()" in template
+    assert "update users set password =" in template
+    assert "Admin password reconciled in metastore." in template

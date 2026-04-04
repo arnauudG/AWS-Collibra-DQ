@@ -1,15 +1,3 @@
----
-tags: []
-
-category: Documentation
-type: data/readme
-complexity: intermediate
-time_required: 15-30 minutes
-created: 2026-02-18
-status: active
-last_updated: 2026-02-18
----
-
 # VPC Endpoints Module
 
 Creates AWS VPC Endpoints for private connectivity to AWS services.

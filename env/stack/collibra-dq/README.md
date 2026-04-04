@@ -90,6 +90,7 @@ uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-wes
 Common variables are documented in root `README.md`. Stack-specific variables to be aware of:
 
 - `TG_VPC_AZ_COUNT` (defaults: `2` in dev, `3` in prod; clamped to 2-3)
+- `TG_COLLIBRA_DQ_PUBLIC_SUBNET` (defaults: `true` in dev, always `false` in prod; places EC2 in public subnet and disables NAT Gateway + interface VPC endpoints, saving ~$55/mo)
 - `COLLIBRA_DQ_PACKAGE_FILENAME`
 - `COLLIBRA_DQ_PACKAGE_URL` (optional override; otherwise resolved automatically from shared artifact bucket)
 - `COLLIBRA_DQ_ENABLE_STANDALONE_HOOK` (optional; default `false`; only for direct standalone apply flows)
@@ -111,6 +112,7 @@ Common variables are documented in root `README.md`. Stack-specific variables to
 - Health checks use `traffic-port` with matcher `200-499`.
 - Temporary unhealthy targets are expected while initial Collibra install completes.
 - Because ALB and RDS both require multi-subnet placement, the minimum valid footprint is 2 public + 2 private subnets.
+- In dev (default), EC2 runs in a public subnet to avoid NAT Gateway and interface VPC endpoint costs. SG rules still restrict ingress to ALB-only. Set `TG_COLLIBRA_DQ_PUBLIC_SUBNET=false` to use private subnet instead.
 
 ## Verification Runbook
 
