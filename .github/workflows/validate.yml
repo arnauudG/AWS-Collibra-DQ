@@ -46,7 +46,9 @@ jobs:
           sudo mv /tmp/terragrunt /usr/local/bin/terragrunt
 
       - name: Install project dependencies
-        run: uv sync --dev
+        run: |
+          uv sync --dev
+          uv pip install -e .
 
       - name: Validate Terragrunt HCL
         run: terragrunt hcl validate --working-dir env --non-interactive --no-color
@@ -55,7 +57,7 @@ jobs:
         run: terraform fmt -check -recursive env module
 
       - name: Run test suite
-        run: uv run python -m pytest
+        run: .venv/bin/python -m pytest
 
       - name: Report coverage
         if: always()
