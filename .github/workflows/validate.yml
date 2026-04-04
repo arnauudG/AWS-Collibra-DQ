@@ -55,7 +55,7 @@ jobs:
         run: terraform fmt -check -recursive env module
 
       - name: Run test suite
-        run: uv run --no-editable python -m pytest
+        run: uv run --no-editable --dev python -m pytest
 
       - name: Report coverage
         if: always()
