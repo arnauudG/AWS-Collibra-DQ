@@ -1,0 +1,58 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/29.6.6 Chrome/144.0.7559.236 Electron/40.8.4 Safari/537.36" version="29.6.6">
+  <diagram id="ops-flow" name="Secret rotation restart flow">
+    <mxGraphModel dx="1131" dy="832" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1200" pageHeight="700" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="e3" edge="1" parent="1" source="ssm" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#DD344C;strokeWidth=2;fontSize=11;fontColor=#545B64;" target="ec2" value="systemctl restart collibra-dq">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="sec" parent="1" style="outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#DD344C;strokeColor=none;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.secrets_manager" value="Secrets Manager&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;RDS master secret rotates&lt;br&gt;(AWS-managed schedule)&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="60" x="130" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="ec2" parent="1" style="outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#ED7100;strokeColor=none;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.ec2" value="EC2 Collibra DQ&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;1. Refresh RDS secret from Secrets Manager&lt;br&gt;2. Verify DB auth (non-blocking)&lt;br&gt;3. Start collibra-dq systemd service&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="60" x="730" y="340" as="geometry" />
+        </mxCell>
+        <mxCell id="cw" parent="1" style="outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#E7157B;strokeColor=none;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.cloudwatch" value="CloudWatch Alarms&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;rotation-target-failures&lt;br&gt;restart-command-failures&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="60" x="430" y="340" as="geometry" />
+        </mxCell>
+        <mxCell id="sns" parent="1" style="outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#E7157B;strokeColor=none;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.sns" value="SNS Topic&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;(optional)&lt;br&gt;COLLIBRA_DQ_ROTATION_ALARM_ACTIONS&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="60" x="130" y="340" as="geometry" />
+        </mxCell>
+        <mxCell id="alb-health" parent="1" style="outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#8C4FFF;strokeColor=none;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.elastic_load_balancing" value="ALB Target Health&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Marks target healthy&lt;br&gt;when :9000 responds&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="60" x="1010" y="340" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="sec" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#DD344C;strokeWidth=2;fontSize=11;fontColor=#545B64;" target="eb" value="Rotation event">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="eb" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#DD344C;strokeWidth=2;fontSize=11;fontColor=#545B64;" target="ssm" value="Invoke restart">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="eb" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#545B64;dashed=1;dashPattern=5 3;fontSize=11;fontColor=#545B64;" target="cw" value="On failure">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="cw" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#545B64;dashed=1;dashPattern=5 3;fontSize=11;fontColor=#545B64;" target="sns" value="Alarm action">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="ec2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;strokeColor=#3F8624;strokeWidth=1;fontSize=11;fontColor=#545B64;" target="alb-health" value=":9000 responds">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="note-happy" parent="1" style="text;html=1;fontSize=11;fontFamily=Arial;fontColor=#DD344C;align=left;fontStyle=2;" value="Happy path (solid red)" vertex="1">
+          <mxGeometry height="20" width="200" x="130" y="560" as="geometry" />
+        </mxCell>
+        <mxCell id="note-fail" parent="1" style="text;html=1;fontSize=11;fontFamily=Arial;fontColor=#545B64;align=left;fontStyle=2;" value="Failure path (dashed gray)" vertex="1">
+          <mxGeometry height="20" width="200" x="130" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="note-health" parent="1" style="text;html=1;fontSize=11;fontFamily=Arial;fontColor=#3F8624;align=left;fontStyle=2;" value="Recovery confirmation (green)" vertex="1">
+          <mxGeometry height="20" width="200" x="130" y="600" as="geometry" />
+        </mxCell>
+        <mxCell id="ssm" parent="1" style="outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#E7157B;strokeColor=none;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.systems_manager" value="SSM RunCommand&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;AWS-RunShellScript&lt;br&gt;systemctl restart collibra-dq&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="60" x="730" y="80" as="geometry" />
+        </mxCell>
+        <mxCell id="eb" parent="1" style="outlineConnect=0;fontColor=#232F3E;gradientColor=none;fillColor=#E7157B;strokeColor=none;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=12;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.eventbridge" value="EventBridge Rule&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;Matches secret ARN&lt;br&gt;3 retries · 1h max event age&lt;/font&gt;" vertex="1">
+          <mxGeometry height="60" width="60" x="430" y="80" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

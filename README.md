@@ -1,407 +1,291 @@
 # AWS Collibra DQ
 
-Infrastructure as Code (IaC) package for deploying **Collibra DQ (Standalone)** on AWS with Terraform + Terragrunt, orchestrated by a `uv`-run Python CLI.
+Infrastructure as Code package for deploying **Collibra DQ (Standalone)** on AWS with Terraform + Terragrunt, orchestrated by a Python CLI.
 
-## Table of Contents
+## Purpose
 
-- [Overview](#overview)
-- [Product Intent (PRD)](#product-intent-prd)
-- [Platform Design (PSD)](#platform-design-psd)
-- [Architecture](#architecture)
-- [Package Contents](#package-contents)
-- [Prerequisites](#prerequisites)
-- [Environment Variables](#environment-variables)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-- [Operational Runbook](#operational-runbook)
-- [Components](#components)
-- [Architecture Decision Records (ADR)](#architecture-decision-records-adr)
-- [Testing Strategy](#testing-strategy)
-- [Troubleshooting](#troubleshooting)
-- [Security Notes](#security-notes)
-- [Contributing](#contributing)
-- [Additional Documentation](#additional-documentation)
+Deploy a complete Collibra DQ environment in AWS through a single CLI command. One command to deploy, one command to destroy, no manual console steps.
 
-## Overview
+## Business context
 
-This package deploys a complete Collibra DQ stack in AWS:
+Platform engineers and DevOps teams need a repeatable way to provision Collibra DQ for development and controlled production rollout. This package provides deterministic deploy/destroy flows, cost-optimized dev defaults, and runtime operational visibility.
 
-- **VPC** with public/private subnets
-- **VPC Endpoints** for SSM and S3 private access
-- **RDS PostgreSQL** for DQ metastore
-- **EC2 standalone node** running Collibra DQ
-- **ALB** exposing the application endpoint
-- **Shared artifact bucket** (env-independent, upload once, deploy everywhere)
-- **Rotation restart automation** (EventBridge -> SSM -> service restart)
-- **Stack-scoped state backend** (S3 + DynamoDB)
+## Scope
 
-Everything runs through:
+**In scope:** VPC networking with multi-AZ subnet layout, RDS PostgreSQL metastore, EC2 standalone Collibra DQ, ALB ingress, package artifact management, secret rotation restart automation, stack-scoped state backend.
 
-```bash
-uv run --no-editable python -m collibra_dq_starter.cli ...
-```
-
-`--no-editable` is recommended for reliability when project paths include spaces.
-
-## Product Intent (PRD)
-
-### Problem Statement
-
-Teams need a repeatable way to deploy Collibra DQ in AWS for development and controlled production rollout, without manual AWS console steps and without hidden operational glue.
-
-### Objectives
-
-- Provide deterministic deploy/destroy flows through a single CLI.
-- Keep dev cost optimized by default (single VPC, minimum valid subnet footprint, single-AZ RDS).
-- Keep deployment idempotent across repeated runs.
-- Keep runtime operational visibility (ALB health, SSM diagnostics, rotation restart observability).
-
-### Non-Goals
-
-- Not a multi-tenant platform.
-- Not a Kubernetes/ECS deployment model.
-- Not a managed CI/CD service.
-- Not HTTPS-by-default (HTTP listener is default unless explicitly extended with ACM/certificate config).
-
-### Success Criteria
-
-- `deploy --target full` completes without manual remediation.
-- ALB target becomes `healthy` and app is reachable via ALB DNS over HTTP.
-- `destroy --target all` completes cleanly even with versioned S3 buckets.
-
-## Platform Design (PSD)
-
-### Control Plane
-
-- `uv` runs Python orchestrator (`collibra_dq_starter.cli`).
-- Orchestrator executes Terragrunt modules in explicit dependency order.
-- State backend is bootstrapped in dedicated stack (`bootstrap`) with S3 + DynamoDB.
-
-### Data Plane
-
-- ALB (internet-facing) forwards to EC2 Collibra DQ (`:9000`).
-- EC2 connects to RDS PostgreSQL (`dqMetastore`).
-- Package artifacts are read from shared S3 artifact bucket.
-- Rendered install script is stored in per-env S3 install-script bucket.
-
-### Operational Contracts
-
-- Full deploy path owns target registration through module ordering, including `alb/target-group-attachment`.
-- Standalone direct apply hook for target re-attachment is opt-in only (`COLLIBRA_DQ_ENABLE_STANDALONE_HOOK=true`).
-- ALB default listener is HTTP (`80`), so browser endpoint is `http://<alb-dns>/`.
+**Out of scope:** multi-tenant deployment, Kubernetes/ECS, managed CI/CD, HTTPS by default (HTTP listener is the baseline; TLS/ACM is an explicit extension).
 
 ## Architecture
 
-```
-                        Internet / Client Browser
-                                  |
-                                  v
-                      +-------------------------+
-                      | Application Load        |
-                      | Balancer (HTTP default) |
-                      +-----------+-------------+
-                                  |
-                                  v
-         +------------------------------------------------------+
-         | AWS Account                                          |
-         |                                                      |
-         |   +-------------------- VPC ----------------------+  |
-         |   |                                               |  |
-         |   |  Public or Private Subnet (dev: public default) |  |
-         |   |  +---------------------+                      |  |
-         |   |  | EC2 Collibra DQ     |<-- S3 package ------+--+-- S3
-         |   |  | (port 9000)         |                      |  |
-         |   |  +----------+----------+                      |  |
-         |   |             |                                 |  |
-         |   |             v                                 |  |
-         |   |      +-------------+                          |  |
-         |   |      | RDS Postgres|                          |  |
-         |   |      +-------------+                          |  |
-         |   |                                               |  |
-         |   |  VPC Endpoints (S3 always; SSM if private)    |  |
-         |   +-----------------------------------------------+  |
-         |                                                      |
-         +------------------------------------------------------+
-```
+The stack deploys Collibra DQ as a standalone EC2 workload in a public subnet behind an internet-facing ALB, backed by RDS PostgreSQL in a private subnet.
 
-## Package Contents
+See `collibra-dq-architecture.drawio` for the full diagram (two tabs: infrastructure topology with subnet layout, and operations flow).
+
+### Network layout
+
+The VPC is carved into `/22` subnets (1024 IPs each) using `cidrsubnet(cidr, 6, index)`, distributed across availability zones. Dev uses 2 AZs; prod uses 3.
 
 ```
-AWS Classic Collibra Data Quality/
-├── pyproject.toml                    # uv package + entrypoint
-├── uv.lock                           # lockfile
-├── .pre-commit-config.yaml           # checks and formatting
-├── README.md                         # this guide
-├── env.example                       # environment variable reference template
-├── CONTRIBUTING.md                   # contribution/release checklist
+VPC 10.11.0.0/16 (dev) · 10.21.0.0/16 (prod)
+├── Public subnets (/22 per AZ)
+│   ├── AZ-a: 10.11.0.0/22   ← ALB, EC2 Collibra DQ, NAT gateway
+│   ├── AZ-b: 10.11.4.0/22   ← ALB target (spans both AZs)
+│   └── AZ-c: 10.21.8.0/22   ← prod only, ALB + NAT per-AZ
 │
-├── src/collibra_dq_starter/
-│   ├── cli.py                        # argparse interface
-│   ├── orchestrator.py               # deploy/destroy orchestration
-│   └── shell.py                      # subprocess wrapper
-│
-├── env/stack/collibra-dq/            # live Terragrunt stack
-│   ├── root.hcl                      # top-level stack config
-│   ├── bootstrap/                    # backend resources
-│   ├── shared/                       # shared artifact bucket (env-independent)
-│   ├── network/                      # vpc + endpoints
-│   ├── database/                     # rds + sg
-│   └── addons/                       # package + ec2 + alb + rotation restart
-│
-├── module/                           # reusable Terraform modules
-│   ├── application/collibra-dq-standalone/  # EC2 standalone install
-│   ├── database/rds/postgresql/             # RDS PostgreSQL
-│   ├── network/                             # vpc, vpc-endpoints, alb, target-group-attachment
-│   ├── operations/secret-rotation-restart/  # event-driven restart + alarms
-│   ├── security/security-group/             # ops (EC2) + rds SG modules
-│   └── storage/s3-package/                  # S3 bucket for artifacts
-└── packages/collibra-dq/             # local Collibra installer artifact
+└── Private subnets (/22 per AZ)
+    ├── AZ-a: 10.11.8.0/22   ← VPC endpoints (SSM trio + S3 gateway)
+    ├── AZ-b: 10.11.12.0/22  ← RDS PostgreSQL (primary)
+    └── AZ-c: 10.21.20.0/22  ← prod only, RDS multi-AZ standby
 ```
 
-## Prerequisites
+Both ALB and RDS subnet groups require subnets in at least two availability zones — this is why the minimum footprint is 2 public + 2 private subnets. Override AZ count with `TG_VPC_AZ_COUNT` (clamped 2–3).
 
-### Required Tools
+### Traffic flow
 
-| Tool | Purpose | Minimum Version |
-|------|---------|-----------------|
-| `uv` | Python runtime + CLI execution | latest |
-| `python` | runtime for CLI | >= 3.10 |
-| `terraform` | infrastructure provisioning | >= 1.5.0 |
-| `terragrunt` | orchestration and dependency handling | latest |
-| `aws` cli | AWS API access and auth | v2.x |
+Browser requests arrive at the ALB in the public subnets on HTTP port 80. The ALB forwards to the EC2 Collibra DQ instance in the AZ-a public subnet on port 9000. The EC2 instance connects to RDS PostgreSQL in the AZ-b private subnet on port 5432 for the `dqMetastore` database. Administrative access to the EC2 instance is through SSM Session Manager via VPC endpoints in the private subnets.
 
-### AWS Permissions
+### Security group chain
 
-Credentials should allow creation/update of:
+Traffic flows through three security groups in sequence:
 
-- VPC, subnets, route tables, NAT gateway
-- EC2, security groups, IAM role/profile
-- RDS PostgreSQL
-- S3 buckets/objects
-- DynamoDB table
-- ALB, target group, listeners
-- CloudWatch logs (depending on module settings)
+```
+Internet → sg-alb (:80) → sg-collibra-dq (:9000) → sg-rds (:5432)
+```
 
-## Environment Variables
+- `sg-alb` allows HTTP/HTTPS from the internet, egress only to port 9000 within the VPC
+- `sg-collibra-dq` allows ingress on 9000 from `sg-alb` only (plus health check and Spark UI ports from VPC CIDR), egress to RDS on 5432
+- `sg-rds` allows ingress on 5432 from `sg-collibra-dq` only
 
-All runtime configuration is environment-driven. See [`env.example`](env.example) for a complete annotated reference of all variables with defaults and descriptions.
+### Storage model
 
-### Required (for deploy/destroy lifecycle)
+Two S3 buckets serve different purposes. The **shared artifact bucket** (`<account>-<org>-collibra-dq-artifacts-<region>`) is environment-independent and holds the large DQ package — upload once, all environments read from it via the S3 gateway VPC endpoint. The **per-env install script bucket** (`<account>-<org>-<env>-collibra-dq-packages-<region>`) holds the rendered install script containing environment-specific secrets.
 
-| Variable | Description |
-|----------|-------------|
-| `TF_VAR_environment` | target environment (`dev` or `prod`) |
-| `TF_VAR_region` | target AWS region (any valid region, e.g. `eu-west-1`, `us-east-1`, `ap-southeast-2`) |
-| `AWS_PROFILE` or `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | AWS authentication |
+### VPC endpoints
 
-### Required for `deploy --target addon` / `deploy --target full`
+Four VPC endpoints keep control-plane and storage traffic off the public internet:
 
-| Variable | Description |
-|----------|-------------|
-| `COLLIBRA_DQ_LICENSE_KEY` | Collibra license key |
+- `ssm`, `ssmmessages`, `ec2messages` — Interface endpoints in private subnets for SSM Session Manager
+- `s3` — Gateway endpoint attached to route tables for package downloads from S3
 
-### Optional but recommended for `deploy --target addon` / `deploy --target full`
+### NAT gateway topology
 
-| Variable | Description |
-|----------|-------------|
-| `COLLIBRA_DQ_PACKAGE_URL` | Optional override package artifact URL (`s3://...` or `https://...`). If unset, orchestrator resolves shared artifact S3 URL automatically. |
-| `COLLIBRA_DQ_ADMIN_PASSWORD` | Password for the built-in Collibra DQ UI admin account `admin` (case-sensitive). Must be 8-72 chars with at least one uppercase, one digit, one special char (`!,%,&,@,#,$,^,?,_,~`), and must not contain `admin`. If unset or invalid, a compliant password is auto-generated. |
-| `COLLIBRA_DQ_AMI_ID` | Override EC2 AMI ID directly. If unset, CLI auto-resolves latest RHEL 7.9 AMI per region. |
-| `COLLIBRA_DQ_ENABLE_STANDALONE_HOOK` | Enables direct-standalone after-hook to auto-reconcile ALB target attachment (`false` by default; not needed for orchestrated full deploy). |
-| `COLLIBRA_DQ_ENABLE_ROTATION_RESTART` | Enable EventBridge->SSM restart on RDS secret rotation (`true` by default) |
-| `COLLIBRA_DQ_ENABLE_ROTATION_ALARMS` | Enable CloudWatch alarms for rotation restart failures (`true` by default) |
-| `COLLIBRA_DQ_ROTATION_ALARM_ACTIONS` | Comma-separated alarm action ARNs (for example SNS topics) |
-| `COLLIBRA_DQ_ROTATION_OK_ACTIONS` | Comma-separated OK action ARNs |
+Dev uses a single NAT gateway in AZ-a (cost optimization). Prod uses one NAT gateway per AZ (resilience). Override with `TG_SINGLE_NAT_GATEWAY`.
 
-Admin credential lifecycle note:
-- `COLLIBRA_DQ_ADMIN_PASSWORD` is guaranteed only for the first successful install against a fresh Collibra DQ metastore.
-- Re-running `deploy --target addon` against an already-existing environment does not reset the UI admin account stored in the existing metastore.
-- `destroy --target addon` followed by `deploy --target addon` does recreate the RDS metastore in the current implementation, so the injected password should be seeded again.
-- `destroy --target all` followed by `deploy --target full` remains the most explicit full-environment rebuild path.
-- The packaged Collibra `setup.sh` writes an encrypted admin password into `owl-env.sh`; this project now overrides that vendor behavior with the raw bootstrap password before `owl-web` starts, otherwise default admin creation can fail with a false `>72 characters` validation error.
-- The override must use the cached bootstrap password captured immediately after `setup.sh` returns, because re-sourcing vendor-generated `owl-env.sh` can blank or replace the admin password variable in the current shell.
+### Secret rotation and restart
 
-### Collibra / Owl terminology mapping
+RDS uses AWS-managed master secrets. When Secrets Manager rotates the password, an EventBridge rule detects the rotation event and invokes SSM RunCommand to restart the `collibra-dq` systemd service on the EC2 instance. Pre-start hooks refresh the latest secret and verify DB auth before the service starts. CloudWatch alarms monitor both EventBridge target invocation failures and failed SSM restart commands.
 
-- `Owl DQ` and `Collibra DQ` are equivalent in this project.
-- `OWL_BASE` and `OWL_HOME` refer to the same install directory.
-- `METASTORE_USER`/`METASTORE_PASS` correspond to `OWL_METASTORE_USER`/`OWL_METASTORE_PASS`.
-- Username and password values are case-sensitive.
-- The Collibra DQ UI login username is `admin`. The installer also records an admin email for setup, but that email is not the UI username.
-- License activation only requires `COLLIBRA_DQ_LICENSE_KEY`; expiration date is not used in this workflow.
-- RDS master password is managed by AWS Secrets Manager and refreshed on app restart/start; rotation can also trigger restart automatically.
-- Rotation guardrails create CloudWatch alarms for EventBridge target failures and failed SSM restart commands.
+### State backend
 
-### Dynamic top-level config (`TG_*`)
+A dedicated S3 bucket (versioned, encrypted) + DynamoDB lock table is bootstrapped per stack/environment as the first deployment step. This isolates state across environments and prevents cross-environment interference.
 
-These drive reusable naming and defaults in `env/stack/collibra-dq/root.hcl`.
+## Module execution order
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `TG_ORG` | `dq` | organization/name prefix |
-| `TG_PROJECT` | `Collibra-DQ-Starter` | tag value |
-| `TG_COST_CENTER` | `Engineering` | tag value |
-| `TG_EXPECTED_ACCOUNT_ID` | unset | safety check against wrong account |
-| `TG_ACCOUNT_ID` | `unknown-account` fallback | static validation fallback |
-| `TG_COLLIBRA_DQ_VPC_CIDR` | env-based default | VPC CIDR |
-| `TG_VPC_AZ_COUNT` | `2` in dev, `3` in prod | AZ/subnet footprint (clamped to 2-3) |
-| `TG_SINGLE_NAT_GATEWAY` | env-based default | NAT topology |
-| `TG_ENABLE_FLOW_LOG` | env-based default | VPC flow log |
-| `TG_RDS_INSTANCE_CLASS` | env-based default | DB class |
-| `TG_RDS_ALLOCATED_STORAGE` | `100` | initial DB storage |
-| `TG_RDS_MAX_ALLOCATED_STORAGE` | env-based default | autoscaling storage max |
-| `TG_RDS_DELETION_PROTECTION` | env-based default | DB deletion guard |
-| `TG_RDS_MULTI_AZ` | `false` in dev, `true` in prod | high availability |
-| `TG_RDS_BACKUP_RETENTION` | env-based default | backup days |
-| `TG_COLLIBRA_DQ_INSTANCE_TYPE` | env-based default | EC2 instance type |
-| `TG_COLLIBRA_DQ_VOLUME_SIZE` | env-based default | EC2 root volume size |
-| `TG_COLLIBRA_DQ_PUBLIC_SUBNET` | `true` in dev, always `false` in prod | Place EC2 in public subnet (saves ~$55/mo by skipping NAT Gateway + VPC interface endpoints) |
-| `TG_ALB_DELETION_PROTECTION` | env-based default | ALB deletion guard |
+The CLI orchestrator (`collibra_dq_starter.cli`) executes Terragrunt modules in deterministic order. Direct Terragrunt usage is advanced-only.
 
-## Quick Start
+### Deploy order
+
+| Step | Module path | Domain | bootstrap | stack | addon | package | full |
+|------|-------------|--------|:---------:|:-----:|:-----:|:-------:|:----:|
+| 1 | `bootstrap` | State | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 2 | `shared/artifact-bucket` | Storage | | ✓ | ✓ | ✓ | ✓ |
+| 3 | `network/vpc` | Network | | ✓ | | | ✓ |
+| 4 | `network/vpc-endpoints` | Network | | ✓ | | | ✓ |
+| 5 | `addons/.../install-script-bucket` | Storage | | | ✓ | | ✓ |
+| 6 | `addons/.../package-upload` | Storage | | | | ✓ | ✓ |
+| 7 | `addons/.../alb/sg-alb` | Security | | | ✓ | | ✓ |
+| 8 | `addons/.../sg-collibra-dq` | Security | | | ✓ | | ✓ |
+| 9 | `database/rds-collibra-dq/sg-rds` | Security | | | ✓ | | ✓ |
+| 10 | `database/rds-collibra-dq/rds` | Database | | | ✓ | | ✓ |
+| 11 | `addons/collibra-dq-standalone` | Compute | | | ✓ | | ✓ |
+| 12 | `addons/.../rotation-restart` | Ops | | | ✓ | | ✓ |
+| 13 | `addons/.../alb` | Network | | | ✓ | | ✓ |
+| 14 | `addons/.../alb/target-group-attachment` | Network | | | ✓ | | ✓ |
+
+### Destroy order
+
+Reverse of deploy. `destroy --target addon` removes steps 14–5. `destroy --target stack` removes 14–3. `destroy --target all` removes everything including bootstrap and shared bucket.
+
+## Configuration reference
+
+### Variables by deploy target
+
+| Variable | bootstrap | stack | addon | package | full | Notes |
+|----------|:---------:|:-----:|:-----:|:-------:|:----:|-------|
+| `TF_VAR_environment` | ✓ | ✓ | ✓ | ✓ | ✓ | `dev` or `prod` |
+| `TF_VAR_region` | ✓ | ✓ | ✓ | ✓ | ✓ | `eu-west-1`, `us-east-1`, `eu-central-1` |
+| AWS credentials | ✓ | ✓ | ✓ | ✓ | ✓ | `AWS_PROFILE` or access key pair |
+| `COLLIBRA_DQ_LICENSE_KEY` | | | ✓ | | ✓ | Required for app deploy |
+| `COLLIBRA_DQ_ADMIN_PASSWORD` | | | opt | | opt | Auto-generated if unset/invalid |
+| `COLLIBRA_DQ_AMI_ID` | | | auto | | auto | CLI auto-resolves RHEL 7.9 |
+| `COLLIBRA_DQ_PACKAGE_FILENAME` | | | | ✓ | opt | Default: `dq-2025.11-SPARK356-JDK17-package-full.tar` |
+
+Legend: ✓ = required, opt = optional override, auto = CLI auto-resolves
+
+### Collibra runtime variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COLLIBRA_DQ_PACKAGE_URL` | auto | Override package S3 URL (auto-resolved from shared bucket) |
+| `COLLIBRA_DQ_ENABLE_STANDALONE_HOOK` | `false` | Enable ALB target auto-reconcile for direct standalone applies |
+| `COLLIBRA_DQ_ENABLE_ROTATION_RESTART` | `true` | Enable EventBridge→SSM restart on secret rotation |
+| `COLLIBRA_DQ_ENABLE_ROTATION_ALARMS` | `true` | Enable CloudWatch alarms for rotation failures |
+| `COLLIBRA_DQ_ROTATION_ALARM_ACTIONS` | empty | Comma-separated alarm action ARNs (e.g. SNS topics) |
+| `COLLIBRA_DQ_ROTATION_OK_ACTIONS` | empty | Comma-separated OK action ARNs |
+| `COLLIBRA_DQ_RDS_PASSWORD_SSM_PARAMETER` | empty | SSM SecureString for RDS password (runtime fetch) |
+| `COLLIBRA_DQ_ADMIN_PASSWORD_SSM_PARAMETER` | empty | SSM SecureString for admin password (runtime fetch) |
+| `COLLIBRA_DQ_LICENSE_KEY_SSM_PARAMETER` | empty | SSM SecureString for license key (runtime fetch) |
+
+### TG_* stack overrides
+
+These drive naming, defaults, and cost topology in `env/stack/collibra-dq/root.hcl`.
+
+| Variable | Dev default | Prod default | Description |
+|----------|-------------|--------------|-------------|
+| `TG_ORG` | `dq` | `dq` | Organization/name prefix |
+| `TG_VPC_AZ_COUNT` | `2` | `3` | AZ count (clamped 2–3) |
+| `TG_COLLIBRA_DQ_VPC_CIDR` | `10.11.0.0/16` | `10.21.0.0/16` | VPC CIDR block |
+| `TG_SINGLE_NAT_GATEWAY` | `true` | `false` | NAT topology |
+| `TG_ENABLE_FLOW_LOG` | `false` | `true` | VPC flow logs |
+| `TG_RDS_INSTANCE_CLASS` | `db.t3.medium` | `db.t3.small` | DB instance class |
+| `TG_RDS_MULTI_AZ` | `false` | `true` | RDS high availability |
+| `TG_RDS_DELETION_PROTECTION` | `false` | `true` | DB deletion guard |
+| `TG_COLLIBRA_DQ_INSTANCE_TYPE` | `m5.large` | `m5.xlarge` | EC2 instance type |
+| `TG_ALB_DELETION_PROTECTION` | `false` | `true` | ALB deletion guard |
+| `TG_EXPECTED_ACCOUNT_ID` | unset | unset | Safety check against wrong account |
+
+### Collibra / Owl terminology
+
+`Owl DQ` and `Collibra DQ` are equivalent. `OWL_BASE`/`OWL_HOME` refer to the same install directory. `METASTORE_USER`/`METASTORE_PASS` correspond to `OWL_METASTORE_USER`/`OWL_METASTORE_PASS`. All credential values are case-sensitive.
+
+## Quick start
 
 ```bash
-# 1) Clone
+# 1. Clone and install
 git clone <repository-url>
 cd "AWS Classic Collibra Data Quality"
-
-# 2) Install/sync python package
 uv sync
 
-# 3) Configure environment variables (use env.example as a reference)
-cp env.example .env.dev
-# Edit .env.dev with your values, then source it:
-source .env.dev
-
-# Or export manually:
+# 2. Set required variables
 export TF_VAR_environment=dev
 export TF_VAR_region=eu-west-1
 export AWS_PROFILE=my-profile
-# Optional: if omitted, installer auto-generates a policy-compliant password.
-export COLLIBRA_DQ_ADMIN_PASSWORD='<password>'
 export COLLIBRA_DQ_LICENSE_KEY='<license-key>'
 
-# 4) Deploy full stack (package auto-uploads from packages/collibra-dq/ if not in S3)
+# 3. Deploy (package auto-uploads from packages/collibra-dq/ if missing)
 uv run --no-editable python -m collibra_dq_starter.cli deploy --target full
-
-# 5) Optional: use --parallel to run independent modules concurrently within each stage
-uv run --no-editable python -m collibra_dq_starter.cli deploy --target full --parallel
 ```
+
+`--no-editable` is recommended when project paths include spaces.
 
 ## Usage
 
-### Command Reference
+### Command reference
 
 ```bash
 # Help
 uv run --no-editable python -m collibra_dq_starter.cli --help
 
-# Deploy full stack: bootstrap + infra + addons
+# Full deploy
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target full
 
-# Deploy with parallel stage execution (independent modules run concurrently)
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target full --parallel
-
-# Deploy bootstrap + infrastructure only
+# Infrastructure only (no app)
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target stack
 
-# Deploy addons only (requires stack dependencies already in place)
+# App layer only (infra must exist)
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target addon
 
-# Deploy package artifact bucket/content only
+# Package artifact only
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target package
 
-# Deploy backend only
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target bootstrap
-
-# Destroy addons only
+# Destroy app layer
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 destroy --target addon
 
-# Destroy package artifact bucket/content only
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 destroy --target package
-
-# Destroy addons + infra, keep backend
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 destroy --target stack
-
-# Destroy everything, including backend
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 destroy --target all
-
-# Non-interactive destroy (CI/automation)
+# Destroy everything
 uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 destroy --target all --yes
-
-# Destroy with parallel stage execution
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 destroy --target all --yes --parallel
 ```
 
-### Target Matrix
+### Target matrix
 
 | Command | Target | What it does |
 |---------|--------|--------------|
-| `deploy` | `bootstrap` | deploy/import state backend only |
-| `deploy` | `stack` | backend + core infra (network) |
-| `deploy` | `addon` | backend + addon/app layers only |
-| `deploy` | `package` | backend + package artifact module only |
-| `deploy` | `full` | stack + DB + app + ALB + rotation ops (auto-uploads package if missing) |
-| `destroy` | `addon` | app + DB + ALB layers only |
-| `destroy` | `package` | package upload module only |
-| `destroy` | `stack` | addon + core infra, preserve backend + shared bucket |
-| `destroy` | `all` | addon + infra + package + shared bucket + backend teardown |
+| `deploy` | `bootstrap` | State backend only (S3 + DynamoDB) |
+| `deploy` | `stack` | Backend + core infra (VPC, endpoints) |
+| `deploy` | `addon` | Backend + addon/app layers (SGs, RDS, EC2, ALB, ops) |
+| `deploy` | `package` | Backend + package artifact module only |
+| `deploy` | `full` | All of the above (auto-uploads package if missing) |
+| `destroy` | `addon` | App + DB + ALB layers only |
+| `destroy` | `package` | Package upload module only |
+| `destroy` | `stack` | Addon + core infra, preserve backend + shared bucket |
+| `destroy` | `all` | Everything including backend teardown |
 
-### Artifact Flow
+### Artifact flow
 
-Package artifacts use a **shared artifact bucket** (`<account>-<org>-collibra-dq-artifacts-<region>`) that is env-independent. Upload the package once and all environments read from it.
+Place the Collibra DQ installer `.tar` in `packages/collibra-dq/`. During `deploy --target full`, the CLI auto-uploads it to the shared artifact bucket if not already present. For explicit upload: `deploy --target package`. To upgrade: drop a new `.tar`, run `deploy --target package`, redeploy EC2.
 
-```bash
-# Option A: Explicit upload (independent lifecycle)
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target package
+## Prerequisites
 
-# Option B: Auto-upload during full deploy
-# Place the .tar in packages/collibra-dq/ and run full deploy — the CLI auto-uploads if missing from S3.
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target full
+| Tool | Purpose | Minimum version |
+|------|---------|-----------------|
+| `uv` | Python runtime + CLI | latest |
+| `python` | CLI runtime | >= 3.10 |
+| `terraform` | Infrastructure provisioning | >= 1.5.0 |
+| `terragrunt` | Orchestration and dependencies | latest |
+| `aws` CLI | AWS API access | v2.x |
+
+AWS credentials must allow creation of VPC, EC2, RDS, S3, DynamoDB, ALB, IAM, and CloudWatch resources.
+
+## Package contents
+
+```
+├── pyproject.toml                       # uv package + entrypoint
+├── src/collibra_dq_starter/
+│   ├── cli.py                           # argparse interface (dqctl)
+│   ├── orchestrator.py                  # deploy/destroy orchestration
+│   └── shell.py                         # subprocess wrapper
+├── env/
+│   ├── common.hcl                       # provider + backend generation
+│   └── stack/collibra-dq/
+│       ├── root.hcl                     # stack config, naming, env defaults
+│       ├── bootstrap/                   # state backend (S3 + DynamoDB)
+│       ├── shared/artifact-bucket/      # env-independent package storage
+│       ├── network/
+│       │   ├── vpc/                     # VPC + subnets + NAT
+│       │   └── vpc-endpoints/           # SSM trio + S3 gateway
+│       ├── database/rds-collibra-dq/
+│       │   ├── sg-rds/                  # RDS security group
+│       │   └── rds/                     # RDS PostgreSQL instance
+│       └── addons/collibra-dq-standalone/
+│           ├── install-script-bucket/   # per-env S3 bucket
+│           ├── package-upload/          # artifact upload module
+│           ├── sg-collibra-dq/          # EC2 security group
+│           ├── (main)                   # EC2 instance + user-data
+│           ├── rotation-restart/        # EventBridge + SSM + alarms
+│           └── alb/
+│               ├── sg-alb/             # ALB security group
+│               ├── (main)             # ALB + listener + target group
+│               └── target-group-attachment/
+├── module/                              # reusable Terraform modules
+│   ├── application/collibra-dq-standalone/
+│   ├── database/rds/postgresql/
+│   ├── network/vpc, alb, vpc-endpoints/
+│   ├── security/security-group/ops, rds/
+│   ├── storage/s3-package/
+│   └── operations/secret-rotation-restart/
+└── packages/collibra-dq/                # local installer artifact
 ```
 
-**Upgrade workflow:** drop a new `.tar` in `packages/collibra-dq/`, run `deploy --target package`. All environments pick up the new package on next EC2 redeploy.
+## Operational runbook
 
-The per-env install-script bucket (which holds the rendered install script with env-specific secrets) is created automatically and managed separately.
-
-## Operational Runbook
-
-This runbook is the recommended self-service flow for operators.
-
-Cost-optimized dev defaults:
-
-- single VPC
-- 2 AZ network footprint (2 public + 2 private subnets)
-- single NAT gateway
-- RDS single-AZ (`multi_az=false`)
-
-### 1) Preflight
+### Preflight
 
 ```bash
 aws sts get-caller-identity
 uv run --no-editable python -m collibra_dq_starter.cli --help
 ```
 
-Required context:
-
-- `TF_VAR_environment`
-- `TF_VAR_region`
-- `AWS_PROFILE` (or access key env vars)
-- `COLLIBRA_DQ_LICENSE_KEY`
-
-For direct `terragrunt`/`terraform` applies on the standalone module, set:
-
-```bash
-export COLLIBRA_DQ_AMI_ID=<rhel-7.9-ami-id>
-```
-
-### 2) Deploy
-
-```bash
-uv run --no-editable python -m collibra_dq_starter.cli --env dev --region eu-west-1 deploy --target full
-```
-
-### 3) Verify target registration and health
+### Verify target health after deploy
 
 ```bash
 export REGION="eu-west-1"
@@ -410,36 +294,26 @@ export TG_ARN="<target-group-arn>"
 aws elbv2 describe-target-health \
   --target-group-arn "$TG_ARN" \
   --region "$REGION" \
-  --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State,TargetHealth.Reason,TargetHealth.Description]' \
+  --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State,TargetHealth.Reason]' \
   --output table
 ```
 
-Expected lifecycle:
+Expected: `initial` during startup, then `healthy` when DQ Web is listening on `:9000`.
 
-- `initial` + `Elb.RegistrationInProgress` during startup.
-- `healthy` when DQ Web is listening on `:9000`.
-
-If output is empty, no target is registered.
-
-### 4) If instance was replaced, confirm target attachment sync
-
-When `addons/collibra-dq-standalone` is re-applied with instance replacement:
-
-- in orchestrated deploys, target-group attachment is handled by ordered module execution
-- in direct standalone applies, after-hook auto-reconcile is available only when `COLLIBRA_DQ_ENABLE_STANDALONE_HOOK=true`
-
-If the hook is skipped or fails in your execution context, run this fallback command:
+### Verify ALB endpoint
 
 ```bash
-cd "env/stack/collibra-dq/addons/collibra-dq-standalone/alb/target-group-attachment"
-terragrunt apply --auto-approve
+export AWS_PAGER=""
+ALB_DNS=$(cd env/stack/collibra-dq/addons/collibra-dq-standalone/alb && terragrunt output -raw load_balancer_dns_name)
+curl -I "http://$ALB_DNS/"
 ```
 
-### 5) Pull runtime diagnostics through SSM
+Expected: HTTP 302 (redirect to `/login`) or 200. Use `http://` — default listener is HTTP only.
+
+### SSM diagnostics
 
 ```bash
-export INSTANCE_ID="$(cd "env/stack/collibra-dq/addons/collibra-dq-standalone" && terragrunt output -raw instance_id)"
-export REGION="eu-west-1"
+INSTANCE_ID=$(cd env/stack/collibra-dq/addons/collibra-dq-standalone && terragrunt output -raw instance_id)
 
 CMD_ID=$(aws ssm send-command \
   --region "$REGION" \
@@ -448,11 +322,9 @@ CMD_ID=$(aws ssm send-command \
   --parameters 'commands=[
     "cloud-init status --long || true",
     "cat /var/lib/collibra-dq-install/status.env || true",
-    "systemctl status cloud-final --no-pager -l || true",
     "systemctl status collibra-dq --no-pager -l || true",
     "ss -tlnp | egrep \"9000|9101\" || true",
-    "tail -n 200 /var/log/collibra-dq-install.log || true",
-    "tail -n 120 /var/log/collibra-dq-setup.log || true"
+    "tail -n 100 /var/log/collibra-dq-install.log || true"
   ]' \
   --query 'Command.CommandId' --output text)
 
@@ -461,309 +333,117 @@ aws ssm get-command-invocation \
   --region "$REGION" \
   --command-id "$CMD_ID" \
   --instance-id "$INSTANCE_ID" \
-  --query '[Status,StatusDetails,StandardOutputContent,StandardErrorContent]' \
   --output json
 ```
 
-### 6) Verify ALB endpoint from operator machine
+### Health-driven acceptance
 
-Disable AWS CLI pager first to prevent commands from dropping into `(END)` output views:
+Service health is the source of truth, not cloud-init status. Accept the environment as operational when all three are true:
 
-```bash
-export AWS_PAGER=""
-```
+1. ALB target health is `healthy`
+2. Port 9000 is listening on the instance (`ss -tlnp`)
+3. Local HTTP probe returns 200 or 302 (`curl http://127.0.0.1:9000/`)
 
-Resolve ALB DNS from target group and verify external response:
+If `status.env` shows `PHASE=HANDOFF` with a non-zero exit code but checks 1–3 are green, classify as a non-blocking bootstrap warning.
 
-```bash
-export TG_ARN="<target-group-arn>"
-export REGION="eu-west-1"
+### Target re-attachment after instance replacement
 
-LB_ARN=$(aws elbv2 describe-target-groups \
-  --region "$REGION" \
-  --target-group-arns "$TG_ARN" \
-  --query 'TargetGroups[0].LoadBalancerArns[0]' \
-  --output text)
-
-ALB_DNS=$(aws elbv2 describe-load-balancers \
-  --region "$REGION" \
-  --load-balancer-arns "$LB_ARN" \
-  --query 'LoadBalancers[0].DNSName' \
-  --output text)
-
-echo "$ALB_DNS"
-curl -I "http://$ALB_DNS/"
-```
-
-Expected: HTTP `302` redirect to `/login` or HTTP `200`.
-
-Retrieve the effective UI credentials from the instance when needed:
+When the EC2 instance is replaced, target-group attachment is handled automatically in orchestrated deploys. For direct standalone applies:
 
 ```bash
-export REGION="eu-west-1"
-export INSTANCE_ID="$(cd env/stack/collibra-dq/addons/collibra-dq-standalone && terragrunt output -raw instance_id)"
-
-CMD_ID=$(aws ssm send-command \
-  --region "$REGION" \
-  --instance-ids "$INSTANCE_ID" \
-  --document-name "AWS-RunShellScript" \
-  --parameters 'commands=["bash -lc '\''eval \"$(grep \"^export DQ_ADMIN_UI_USERNAME=\" /etc/profile.d/collibra-dq.sh)\"; eval \"$(grep \"^export DQ_ADMIN_USER_PASSWORD=\" /etc/profile.d/collibra-dq.sh)\"; printf \"LOGIN_USER=%s\nLOGIN_PASSWORD=%s\n\" \"$DQ_ADMIN_UI_USERNAME\" \"$DQ_ADMIN_USER_PASSWORD\"'\''"]' \
-  --query "Command.CommandId" \
-  --output text)
-
-sleep 3
-
-aws ssm get-command-invocation \
-  --region "$REGION" \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --query 'StandardOutputContent' \
-  --output text
-```
-
-Expected login username: `admin`
-
-If a fresh rebuild still cannot authenticate, inspect the admin bootstrap debug artifacts on the instance:
-
-```bash
-export REGION="eu-west-1"
-export INSTANCE_ID="$(cd env/stack/collibra-dq/addons/collibra-dq-standalone && terragrunt output -raw instance_id)"
-
-CMD_ID=$(aws ssm send-command \
-  --region "$REGION" \
-  --instance-ids "$INSTANCE_ID" \
-  --document-name "AWS-RunShellScript" \
-  --parameters 'commands=["bash -lc '\''echo \"--- /etc/collibra-dq/admin-bootstrap-debug.env ---\"; cat /etc/collibra-dq/admin-bootstrap-debug.env; echo; echo \"--- tail -n 120 /var/log/collibra-dq-setup.log ---\"; tail -n 120 /var/log/collibra-dq-setup.log'\''"]' \
-  --query "Command.CommandId" \
-  --output text)
-
-sleep 3
-
-aws ssm get-command-invocation \
-  --region "$REGION" \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --query 'StandardOutputContent' \
-  --output text
-```
-
-What to look for:
-- `DQ_ADMIN_PASSWORD_SOURCE=provided` means the supplied password passed local validation and was handed to `setup.sh`.
-- `generated-empty` or `generated-invalid` means the installer replaced your input before initialization.
-- The `setup.sh` tail and the sanitized admin/password hints show whether Collibra reported any password, login, or credential-related rejection during initial setup.
-
-### 7) Interpret bootstrap status correctly
-
-Use this precedence when values disagree:
-
-1. ALB target health (`healthy` is authoritative for traffic readiness).
-2. Instance listener (`ss -tlnp` shows `*:9000`).
-3. Local HTTP probe (`curl http://127.0.0.1:9000/` returns `200` or `302`).
-4. `cloud-init` and `/var/lib/collibra-dq-install/status.env`.
-
-If `status.env` shows `PHASE=HANDOFF` with `LAST_EXIT_CODE=1/2` but checks 1-3 are green, treat deployment as operational and classify it as a non-blocking bootstrap warning.
-
-## Components
-
-### Bootstrap
-
-Creates and manages stack backend resources:
-
-- S3 bucket for tfstate
-- DynamoDB table for state lock
-- import-aware behavior if resources exist but state is missing
-
-### Network
-
-- VPC and subnets
-- VPC endpoints for SSM and S3 access from private subnet workloads
-
-### Data Layer
-
-- RDS PostgreSQL instance
-- dedicated RDS security group with controlled ingress
-
-### Application Layer
-
-- EC2 standalone Collibra DQ install/bootstrap
-- ALB + target group attachment
-
-### Operations Layer
-
-- runtime secret refresh + DB auth verification on service start
-- event-driven restart on RDS secret rotation (`addons/collibra-dq-standalone/rotation-restart`)
-- CloudWatch alarms for restart orchestration failures
-
-### Artifact Layer
-
-- **Shared artifact bucket** (`shared/artifact-bucket`) — env-independent, holds DQ package
-- **Per-env install-script bucket** (`addons/collibra-dq-standalone/install-script-bucket`) — holds rendered install script with secrets
-- Package upload module (`addons/collibra-dq-standalone/package-upload`) — uploads to shared bucket
-- Can be deployed separately with `deploy --target package`
-
-## Architecture Decision Records (ADR)
-
-Detailed ADRs live under [docs/adr/README.md](docs/adr/README.md). This section keeps the short operator summary.
-
-- [ADR-001](docs/adr/ADR-001-cli-first-orchestration.md): use the Python CLI as the primary control plane over raw Terragrunt.
-- [ADR-002](docs/adr/ADR-002-environment-driven-configuration.md): prefer environment-driven configuration over per-client repo variants.
-- [ADR-003](docs/adr/ADR-003-stack-scoped-backend.md): keep Terraform backend resources stack-scoped.
-- [ADR-004](docs/adr/ADR-004-shared-artifact-and-install-script-buckets.md): split shared package storage from env-specific rendered install scripts.
-- [ADR-005](docs/adr/ADR-005-cost-optimized-dev-defaults.md): optimize dev defaults for cost while preserving valid ALB/RDS topology.
-- [ADR-006](docs/adr/ADR-006-http-only-alb-by-default.md): keep HTTP as the default ALB ingress path.
-- [ADR-007](docs/adr/ADR-007-standalone-hook-opt-in.md): make the standalone target-attachment hook opt-in.
-- [ADR-008](docs/adr/ADR-008-service-health-over-bootstrap-status.md): treat service health as the operational source of truth.
-
-## Testing Strategy
-
-Detailed proposed coverage lives in [docs/testing-strategy.md](docs/testing-strategy.md).
-
-High-priority coverage areas are:
-
-- unit tests for CLI parsing, environment validation, command execution, and naming helpers
-- regression tests for versioned S3 bucket destroy, bootstrap backend false-negatives, install-script bucket recovery, and standalone hook behavior
-- integration tests for Terragrunt/Terraform validation, full deploy smoke, standalone replacement, and `destroy --target all`
-
-Current local test command:
-
-```bash
-python -m pytest
-```
-
-Current enforced local coverage gate: `75%`
-
-### GitHub Actions
-
-**Validation** ([`.github/workflows/validate.yml`](.github/workflows/validate.yml)) runs on push to `main` and on PRs:
-
-- `terragrunt hcl validate --working-dir env --non-interactive --no-color`
-- `terraform fmt -check -recursive env module`
-- `uv run --no-editable python -m pytest`
-
-**Deployment** ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) is triggered manually via `workflow_dispatch`:
-
-- Supports deploy/destroy with all target scopes
-- Uses OIDC for AWS authentication (configure `AWS_ROLE_ARN` secret)
-- Requires `COLLIBRA_DQ_LICENSE_KEY` secret for addon/full deploys
-- Concurrency-locked per environment+region to prevent parallel runs
-- Destroy requires explicit confirmation; prod `destroy --target all` is blocked in CI
-- Post-deploy health check polls ALB target status
-
-#### Required GitHub secrets
-
-| Secret | Purpose |
-|--------|---------|
-| `AWS_ROLE_ARN` | IAM role ARN for OIDC authentication |
-| `COLLIBRA_DQ_LICENSE_KEY` | Collibra license key (for addon/full deploy) |
-| `COLLIBRA_DQ_ADMIN_PASSWORD` | Optional: DQ admin UI password |
-
-AWS smoke tests remain opt-in and are documented in [docs/testing-strategy.md](docs/testing-strategy.md).
-
-## Troubleshooting
-
-### AWS auth errors
-
-Run:
-
-```bash
-aws sts get-caller-identity
-```
-
-Confirm either `AWS_PROFILE` is valid, or access key env vars are set correctly.
-
-### Package upload/install issues
-
-- confirm installer exists under `packages/collibra-dq/`
-- run `deploy --target full` with required Collibra secrets
-- inspect EC2 install logs with SSM if ALB target remains unhealthy
-
-### Target unhealthy behind ALB
-
-- wait for installation completion (can take several minutes)
-- verify SG rules between ALB and EC2
-- confirm application is listening on port `9000`
-- if `describe-target-health` returns no rows, confirm standalone apply hook ran; otherwise run fallback re-apply of `alb/target-group-attachment`
-
-### cloud-init shows `status: error` but target is healthy
-
-Use service health as the runtime source of truth:
-
-- ALB target = `healthy`
-- `ss -tlnp` shows listener on `*:9000`
-- local HTTP probe returns `200` or `302`
-
-In this case, treat cloud-init failure as non-blocking and continue. Inspect `/var/lib/collibra-dq-install/status.env` and `/var/log/collibra-dq-install.log` for the exact phase/exit code.
-
-### ALB returns 503
-
-Run these checks in order:
-
-1. Verify target registration (`describe-target-health` is not empty).
-2. Verify target state is `healthy`.
-3. Verify app listener exists on instance (`*:9000`).
-4. Verify local probe on instance returns `200` or `302`.
-5. Verify ALB DNS response from operator machine.
-
-If `describe-target-health` is empty after instance replacement, run the fallback re-apply:
-
-```bash
-cd "env/stack/collibra-dq/addons/collibra-dq-standalone/alb/target-group-attachment"
+cd env/stack/collibra-dq/addons/collibra-dq-standalone/alb/target-group-attachment
 terragrunt apply --auto-approve
 ```
 
-Then poll until `healthy`:
+## Troubleshooting
 
-```bash
-for i in {1..20}; do
-  aws elbv2 describe-target-health \
-    --region "$REGION" \
-    --target-group-arn "$TG_ARN" \
-    --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State,TargetHealth.Reason,TargetHealth.Description]' \
-    --output table
-  sleep 15
-done
-```
+### ALB returns 503
 
-### Browser shows "refused to connect" on ALB DNS
+1. Check `describe-target-health` — empty means no target is registered (run target-group-attachment apply).
+2. Target present but unhealthy — wait for install to complete, check SG rules and port 9000.
+3. Target healthy — resolve ALB DNS and test `curl -I http://<dns>/` directly.
 
-Most common cause in this stack: opening HTTPS on an HTTP-only listener.
+### Browser shows "refused to connect"
 
-- Default ALB listener is `HTTP :80`
-- Use `http://<alb-dns>/` (not `https://<alb-dns>/`) unless you explicitly configured HTTPS listener + ACM cert
+Default ALB listener is HTTP :80. Use `http://<alb-dns>/`, not `https://`.
+
+### Package upload fails
+
+Confirm the installer exists in `packages/collibra-dq/`. Check the filename matches `COLLIBRA_DQ_PACKAGE_FILENAME`.
+
+### Rotation event did not trigger restart
+
+Check EventBridge rule status in `addons/collibra-dq-standalone/rotation-restart`. Verify the instance is SSM-managed (`aws ssm describe-instance-information`). Inspect CloudWatch alarms for failures.
 
 ### State lock or backend mismatch
 
-- confirm no concurrent apply/destroy is running
-- for wrong account/region issues, use `TG_EXPECTED_ACCOUNT_ID` and explicit `--env/--region`
+Confirm no concurrent apply/destroy is running. Use `TG_EXPECTED_ACCOUNT_ID` to guard against wrong-account deployment.
 
-### Rotation event happened but app did not restart
+## Architecture decision records
 
-- check EventBridge rule status in `addons/collibra-dq-standalone/rotation-restart`
-- inspect CloudWatch alarms for rotation-restart failures
-- verify instance is managed by SSM and online (`aws ssm describe-instance-information`)
-- verify restart hook logs on instance (`journalctl -u collibra-dq`)
+### ADR-001: CLI-first orchestration
 
-## Security Notes
+Deploy/destroy spans backend bootstrap, shared storage, network, database, compute, ALB, and post-deploy recovery. A Python CLI centralizes retry behavior, bucket purge fallback, bootstrap recovery, and environment validation. Direct Terragrunt remains possible for debugging but is not the primary operating model.
 
-1. Terraform state can contain sensitive data; protect backend access.
+### ADR-002: Environment-driven configuration
+
+All runtime config is injected via environment variables (`TF_VAR_*`, `TG_*`, `COLLIBRA_DQ_*`). No static env catalogs, no per-client branch divergence.
+
+### ADR-003: Stack-scoped state backend
+
+Dedicated S3 + DynamoDB per stack/environment isolates failure domains. Bootstrap must be created first; full destroy handles backend deletion as a special case with digest retry.
+
+### ADR-004: Shared artifact bucket + per-env install script
+
+The large package artifact is env-agnostic (upload once). The rendered install script contains env-specific secrets and lives in a separate per-env bucket.
+
+### ADR-005: EC2 in public subnet
+
+The EC2 Collibra DQ instance is deployed into a public subnet in AZ-a alongside the ALB. RDS PostgreSQL runs in a private subnet in AZ-b, accessible only via `sg-rds` which permits ingress from `sg-collibra-dq`. VPC endpoints in private subnets handle SSM and S3 traffic.
+
+### ADR-006: Subnet layout and AZ distribution
+
+`/22` subnets provide 1024 IPs each — large enough for operational headroom, small enough to fit 6 subnets in a `/16`. Dev uses 2 AZs (minimum for ALB + RDS), prod uses 3 for resilience. `cidrsubnet(cidr, 6, index)` generates subnets deterministically.
+
+### ADR-007: Cost-optimized dev defaults
+
+Dev defaults: 2 AZs, single NAT gateway, single-AZ RDS, `m5.large` EC2, no flow logs, no deletion protection. Not equivalent to prod HA posture.
+
+### ADR-008: HTTP-only ALB by default
+
+HTTPS requires ACM certificate and domain decisions. HTTP removes that dependency from baseline deployment.
+
+### ADR-009: Direct standalone hook is opt-in
+
+The ALB target re-attachment after-hook (`COLLIBRA_DQ_ENABLE_STANDALONE_HOOK`) is disabled by default. Full deploy already owns target-group-attachment in module order.
+
+### ADR-010: Service health over bootstrap status
+
+Runtime service signals (ALB target health, port listener, HTTP probe) are the source of truth, not cloud-init exit codes.
+
+## Security notes
+
+1. Terraform state can contain sensitive data — protect backend access with IAM.
 2. Never commit secrets into repo files.
-3. Keep Collibra secrets in CI/CD secret stores or secure shell/session vars.
-4. Prod uses private subnet + SSM access model for app hosts (defense-in-depth). Dev defaults to public subnet for cost savings; SG rules still restrict access to ALB-only. Override with `TG_COLLIBRA_DQ_PUBLIC_SUBNET=false` to force private subnet in dev.
-5. Enable stricter prod settings (`TG_RDS_DELETION_PROTECTION`, `TG_RDS_MULTI_AZ`, TLS/certs where applicable).
+3. Prefer SSM Parameter Store (SecureString) for runtime secrets over embedding values in install scripts.
+4. EC2 runs in a public subnet but ingress is controlled by `sg-collibra-dq` — only the ALB can reach port 9000.
+5. RDS runs in a private subnet with no public accessibility.
+6. VPC endpoints keep SSM and S3 traffic off the public internet.
+7. Enable `TG_RDS_DELETION_PROTECTION`, `TG_RDS_MULTI_AZ`, and TLS/ACM for production.
+8. Set `TG_EXPECTED_ACCOUNT_ID` in CI/CD to prevent cross-account misfire.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for branching strategy, commit style, and release checklist.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for branching strategy, commit conventions, and release checklist.
 
-## Additional Documentation
+## Additional documentation
 
 | Document | Description |
 |----------|-------------|
+| `collibra-dq-architecture.drawio` | Architecture diagrams (network topology + operations flow) |
 | [env/README.md](env/README.md) | Terragrunt directory overview |
-| [env/stack/README.md](env/stack/README.md) | live stack map |
-| [env/stack/collibra-dq/README.md](env/stack/collibra-dq/README.md) | stack-specific details |
-| [docs/adr/README.md](docs/adr/README.md) | full architecture decision record catalog |
-| [docs/testing-strategy.md](docs/testing-strategy.md) | proposed unit, regression, and integration test coverage |
-| [module/application/collibra-dq-standalone/README.md](module/application/collibra-dq-standalone/README.md) | standalone module behavior and startup semantics |
-| [packages/README.md](packages/README.md) | installer package location |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | process and release guidance |
+| [env/stack/README.md](env/stack/README.md) | Live stack map and lifecycle |
+| [env/stack/collibra-dq/README.md](env/stack/collibra-dq/README.md) | Stack-specific details and ADRs |
+| [module/application/collibra-dq-standalone/README.md](module/application/collibra-dq-standalone/README.md) | Standalone module behavior and startup |
+| [packages/README.md](packages/README.md) | Installer package guide |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Process and release guidance |
