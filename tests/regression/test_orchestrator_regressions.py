@@ -243,11 +243,12 @@ def test_installer_template_uses_bootstrap_safe_admin_password_policy_and_genera
     )
     template = template_path.read_text(encoding="utf-8")
 
-    assert "grep -q '^[A-Za-z0-9_]*$' || return 1" in template
-    assert "echo \"$password\" | grep -q '_' || return 1" in template
-    assert "local alphabet='A-Za-z0-9_'" in template
-    assert 'candidate="Aa9_$candidate"' in template
-    assert "bootstrap-safe Collibra policy" in template
+    assert "validate_admin_password_policy()" in template
+    assert "Collibra DQ password policy (from official docs):" in template
+    assert "echo \"$password\" | grep -q '[A-Z]' || return 1" in template
+    assert "echo \"$password\" | grep -q '[0-9]' || return 1" in template
+    assert "local alphabet='A-Za-z0-9'" in template
+    assert "generate_compliant_admin_password()" in template
 
 
 def test_installer_template_uses_shell_safe_refresh_exports_instead_of_percent_q():
@@ -294,10 +295,11 @@ def test_installer_template_restarts_owlweb_after_rewriting_admin_env():
     )
     template = template_path.read_text(encoding="utf-8")
 
-    assert "Restart owl-web unconditionally" in template
+    assert "Restart owl-web so it seeds the admin user in the metastore DB," in template
     assert '"$OWL_MANAGE_SCRIPT" stop=owlweb || true' in template
     assert '"$OWL_MANAGE_SCRIPT" start=owlweb' in template
-    assert 'if [ "$LICENSE_CONFIGURED" = true ]; then' not in template
+    assert "reconcile_admin_password" in template
+    assert "Restart owl-web again so it loads the reconciled password from DB" in template
 
 
 def test_installer_template_reconciles_admin_password_in_metastore():
