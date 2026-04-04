@@ -1,0 +1,234 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      region:
+        description: "AWS region"
+        required: true
+        type: choice
+        options:
+          - eu-west-1
+          - us-east-1
+          - eu-central-1
+          - ap-southeast-2
+        default: eu-west-1
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - deploy
+          - destroy
+      target:
+        description: "Target scope"
+        required: true
+        type: choice
+        options:
+          - full
+          - stack
+          - addon
+          - package
+          - bootstrap
+          - all
+      parallel:
+        description: "Run independent modules in parallel within each stage"
+        required: false
+        type: boolean
+        default: false
+      confirm_destroy:
+        description: "Type 'destroy' to confirm destructive action"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+# Prevent concurrent deploys to the same environment
+concurrency:
+  group: deploy-${{ inputs.environment }}-${{ inputs.region }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Gate: validate inputs ──────────────────────────────────────────────
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate target for action
+        run: |
+          ACTION="${{ inputs.action }}"
+          TARGET="${{ inputs.target }}"
+
+          if [[ "$ACTION" == "deploy" ]]; then
+            case "$TARGET" in
+              full|stack|addon|package|bootstrap) ;;
+              *) echo "::error::Invalid deploy target '$TARGET'. Use: full, stack, addon, package, bootstrap"; exit 1 ;;
+            esac
+          fi
+
+          if [[ "$ACTION" == "destroy" ]]; then
+            case "$TARGET" in
+              addon|stack|package|all) ;;
+              *) echo "::error::Invalid destroy target '$TARGET'. Use: addon, stack, package, all"; exit 1 ;;
+            esac
+          fi
+
+      - name: Require destroy confirmation
+        if: inputs.action == 'destroy'
+        run: |
+          if [[ "${{ inputs.confirm_destroy }}" != "destroy" ]]; then
+            echo "::error::Destroy requires typing 'destroy' in the confirm_destroy input."
+            exit 1
+          fi
+
+      - name: Block destroy --target all on prod
+        if: inputs.action == 'destroy' && inputs.target == 'all' && inputs.environment == 'prod'
+        run: |
+          echo "::error::Full teardown of prod is blocked in CI. Run manually with appropriate safeguards."
+          exit 1
+
+  # ── Main job ───────────────────────────────────────────────────────────
+  run:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TF_VAR_environment: ${{ inputs.environment }}
+      TF_VAR_region: ${{ inputs.region }}
+      TF_INPUT: "0"
+      TG_INPUT: "0"
+      AWS_PAGER: ""
+      COLLIBRA_DQ_LICENSE_KEY: ${{ secrets.COLLIBRA_DQ_LICENSE_KEY }}
+      COLLIBRA_DQ_ADMIN_PASSWORD: ${{ secrets.COLLIBRA_DQ_ADMIN_PASSWORD }}
+      # Package is already in S3 (shared artifact bucket) — runner does not need the 2.7 GB .tar.
+      # Set to true to skip upload; set to false only if you need to re-upload from a self-hosted runner.
+      COLLIBRA_DQ_SKIP_PACKAGE_UPLOAD: "true"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.4"
+          terraform_wrapper: false
+
+      - name: Install Terragrunt
+        env:
+          TERRAGRUNT_VERSION: "0.82.3"
+        run: |
+          curl -fsSL -o /tmp/terragrunt "https://github.com/gruntwork-io/terragrunt/releases/download/v${TERRAGRUNT_VERSION}/terragrunt_linux_amd64"
+          chmod +x /tmp/terragrunt
+          sudo mv /tmp/terragrunt /usr/local/bin/terragrunt
+
+      - name: Install project dependencies
+        run: uv sync
+
+      - name: Resolve AMI ID
+        if: inputs.action == 'deploy' && (inputs.target == 'full' || inputs.target == 'addon')
+        run: |
+          AMI_ID=$(aws ec2 describe-images \
+            --region "${{ inputs.region }}" \
+            --owners 309956199498 \
+            --filters \
+              "Name=name,Values=RHEL-7.9_HVM-*-x86_64-*-Hourly2-GP3" \
+              "Name=state,Values=available" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+            --output text)
+          echo "COLLIBRA_DQ_AMI_ID=$AMI_ID" >> "$GITHUB_ENV"
+          echo "Resolved AMI: $AMI_ID"
+
+      # ── Deploy ───────────────────────────────────────────────────────
+      - name: Deploy
+        if: inputs.action == 'deploy'
+        run: |
+          ARGS="--env ${{ inputs.environment }} --region ${{ inputs.region }} deploy --target ${{ inputs.target }}"
+          if [[ "${{ inputs.parallel }}" == "true" ]]; then
+            ARGS="$ARGS --parallel"
+          fi
+          echo "Running: dqctl $ARGS"
+          uv run --no-editable python -m collibra_dq_starter.cli $ARGS
+
+      # ── Destroy ──────────────────────────────────────────────────────
+      - name: Destroy
+        if: inputs.action == 'destroy'
+        run: |
+          ARGS="--env ${{ inputs.environment }} --region ${{ inputs.region }} destroy --target ${{ inputs.target }} --yes"
+          if [[ "${{ inputs.parallel }}" == "true" ]]; then
+            ARGS="$ARGS --parallel"
+          fi
+          echo "Running: dqctl $ARGS"
+          uv run --no-editable python -m collibra_dq_starter.cli $ARGS
+
+      # ── Post-deploy health check ─────────────────────────────────────
+      - name: Verify ALB health
+        if: inputs.action == 'deploy' && (inputs.target == 'full' || inputs.target == 'addon')
+        run: |
+          cd env/stack/collibra-dq/addons/collibra-dq-standalone/alb
+
+          # target_group_arns is a map — extract the collibra-dq ARN
+          TG_ARN=$(terragrunt output -json target_group_arns --terragrunt-non-interactive 2>/dev/null \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('collibra-dq',''))" 2>/dev/null || true)
+
+          if [[ -z "$TG_ARN" ]]; then
+            echo "::warning::Could not resolve target group ARN — skipping health check"
+            exit 0
+          fi
+
+          ALB_DNS=$(terragrunt output -raw load_balancer_dns_name --terragrunt-non-interactive 2>/dev/null || true)
+
+          echo "Target group: $TG_ARN"
+          echo "ALB DNS: $ALB_DNS"
+          echo "Polling target health (up to 10 min)..."
+
+          for i in $(seq 1 20); do
+            HEALTH=$(aws elbv2 describe-target-health \
+              --region "${{ inputs.region }}" \
+              --target-group-arn "$TG_ARN" \
+              --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+              --output text 2>/dev/null || echo "unknown")
+
+            echo "  [$i/20] health=$HEALTH"
+
+            if [[ "$HEALTH" == "healthy" ]]; then
+              echo "Target is healthy."
+              echo "## Deploy Success" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **Environment:** \`${{ inputs.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **Region:** \`${{ inputs.region }}\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **ALB:** \`http://$ALB_DNS/\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "- **Target health:** healthy" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            sleep 30
+          done
+
+          echo "::warning::Target did not reach healthy within 10 minutes — this can be normal (install takes 15-20 min)."
+          echo "## Deploy Warning" >> "$GITHUB_STEP_SUMMARY"
+          echo "Target not yet \`healthy\` after 10 min. Collibra DQ install can take 15-20 min." >> "$GITHUB_STEP_SUMMARY"
+          echo "Check via SSM: \`aws ssm start-session --target <instance-id>\`" >> "$GITHUB_STEP_SUMMARY"

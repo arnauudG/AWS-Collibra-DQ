@@ -632,11 +632,30 @@ python -m pytest
 
 Current enforced local coverage gate: `75%`
 
-GitHub validation is defined in [`/.github/workflows/validate.yml`](.github/workflows/validate.yml) and runs:
+### GitHub Actions
+
+**Validation** ([`.github/workflows/validate.yml`](.github/workflows/validate.yml)) runs on push to `main` and on PRs:
 
 - `terragrunt hcl validate --working-dir env --non-interactive --no-color`
 - `terraform fmt -check -recursive env module`
 - `uv run --no-editable python -m pytest`
+
+**Deployment** ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) is triggered manually via `workflow_dispatch`:
+
+- Supports deploy/destroy with all target scopes
+- Uses OIDC for AWS authentication (configure `AWS_ROLE_ARN` secret)
+- Requires `COLLIBRA_DQ_LICENSE_KEY` secret for addon/full deploys
+- Concurrency-locked per environment+region to prevent parallel runs
+- Destroy requires explicit confirmation; prod `destroy --target all` is blocked in CI
+- Post-deploy health check polls ALB target status
+
+#### Required GitHub secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `AWS_ROLE_ARN` | IAM role ARN for OIDC authentication |
+| `COLLIBRA_DQ_LICENSE_KEY` | Collibra license key (for addon/full deploy) |
+| `COLLIBRA_DQ_ADMIN_PASSWORD` | Optional: DQ admin UI password |
 
 AWS smoke tests remain opt-in and are documented in [docs/testing-strategy.md](docs/testing-strategy.md).
 
