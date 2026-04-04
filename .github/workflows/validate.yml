@@ -46,9 +46,7 @@ jobs:
           sudo mv /tmp/terragrunt /usr/local/bin/terragrunt
 
       - name: Install project dependencies
-        run: |
-          uv sync --dev
-          uv pip install -e .
+        run: uv sync --extra dev
 
       - name: Validate Terragrunt HCL
         run: terragrunt hcl validate --working-dir env --non-interactive --no-color
